@@ -50,7 +50,7 @@ export async function acquireSharedOtel(config: PluginConfig, version: string): 
     // A hot-reloaded plugin can reuse an instrument set created by an older
     // build. Backfill instruments added since then instead of dropping their
     // measurements until the process restarts.
-    if (!existing.instruments.ttftHistogram) {
+    if (existing.instruments && !existing.instruments.ttftHistogram) {
       existing.instruments.ttftHistogram = createInstruments(config.metricPrefix).ttftHistogram
     }
     existing.refs += 1

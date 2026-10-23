@@ -5,7 +5,7 @@ import { join } from "node:path"
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json }
 export type Payload = { [key: string]: Json }
 
-export async function runScenario(scenario: "text" | "read", disabledTraces = "") {
+export async function runScenario(scenario: "text" | "read", disabledTraces = "", semconv = "") {
   const directory = await mkdtemp(join(tmpdir(), "opencode-otel-integration-"))
   const requests: Payload[] = []
   const received: Record<string, Payload[]> = { traces: [], metrics: [], logs: [] }
@@ -85,6 +85,7 @@ export async function runScenario(scenario: "text" | "read", disabledTraces = ""
       OPENCODE_OTLP_ENDPOINT: String(receiver.url),
       OPENCODE_OTLP_PROTOCOL: "http/json",
       OPENCODE_DISABLE_TRACES: disabledTraces,
+      OPENCODE_SEMCONV: semconv,
     })
     const git = Bun.spawnSync(["git", "init", "--quiet", directory], { env })
     if (git.exitCode !== 0) throw new Error(git.stderr.toString())

@@ -1,29 +1,7 @@
 import { SeverityNumber } from "@opentelemetry/api-logs"
 import { SpanKind, SpanStatusCode } from "@opentelemetry/api"
-import {
-  AGENT_NAME,
-  INPUT_MIME_TYPE,
-  INPUT_VALUE,
-  LLM_COST_TOTAL,
-  LLM_INPUT_MESSAGES,
-  LLM_MODEL_NAME,
-  LLM_OUTPUT_MESSAGES,
-  LLM_PROVIDER,
-  LLM_SYSTEM,
-  LLM_TOKEN_COUNT_COMPLETION,
-  LLM_TOKEN_COUNT_COMPLETION_DETAILS_REASONING,
-  LLM_TOKEN_COUNT_PROMPT,
-  LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_READ,
-  LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_WRITE,
-  LLM_TOKEN_COUNT_TOTAL,
-  MimeType,
-  OpenInferenceSpanKind,
-  OUTPUT_MIME_TYPE,
-  OUTPUT_VALUE,
-  SemanticConventions,
-  SESSION_ID,
-} from "@arizeai/openinference-semantic-conventions"
 import type { EventOf, HandlerContext, SessionTotals } from "../types.ts"
+import { llmEndAttrs, llmFailAttrs, llmSpanName, llmStartAttrs } from "../semconv.ts"
 import { ensureSession } from "./session.ts"
 import { applyModelContext } from "./chat-headers.ts"
 import {
@@ -37,9 +15,6 @@ import {
   resolveRunContext,
   setBoundedMap,
 } from "../util.ts"
-
-const OPENINFERENCE_SPAN_KIND = SemanticConventions.OPENINFERENCE_SPAN_KIND
-const LLM_FINISH_REASON = "llm.finish_reason"
 
 function billedTokens(tokens: { input: number; output: number; reasoning: number } | undefined): number {
   return (tokens?.input ?? 0) + (tokens?.output ?? 0) + (tokens?.reasoning ?? 0)
@@ -88,21 +63,14 @@ export function handleStepStarted(e: EventOf<"session.step.started">, ctx: Handl
   if (!isTraceEnabled("llm", ctx)) return
   const promptText = ctx.tracing.activePrompts.get(d.sessionID)?.text
   const attributes = {
-    [OPENINFERENCE_SPAN_KIND]: OpenInferenceSpanKind.LLM,
-    [SESSION_ID]: d.sessionID,
-    [AGENT_NAME]: d.agent,
-    "agent.type": agentType,
-    [LLM_SYSTEM]: d.model.providerID,
-    [LLM_PROVIDER]: d.model.providerID,
-    "gen_ai.provider.name": genAiProviderName(d.model.providerID),
-    [LLM_MODEL_NAME]: d.model.id,
-    ...(promptText
-      ? {
-          [INPUT_VALUE]: promptText,
-          [INPUT_MIME_TYPE]: MimeType.TEXT,
-          [LLM_INPUT_MESSAGES]: JSON.stringify([{ role: "user", content: promptText }]),
-        }
-      : {}),
+    ...llmStartAttrs(ctx.semconv, {
+      sessionID: d.sessionID,
+      agent: d.agent,
+      agentType,
+      providerID: d.model.providerID,
+      modelID: d.model.id,
+      ...(promptText ? { promptText } : {}),
+    }),
     ...ctx.commonAttrs,
   }
   const active = ctx.tracing.activeLlm.get(d.sessionID)
@@ -114,7 +82,7 @@ export function handleStepStarted(e: EventOf<"session.step.started">, ctx: Handl
     provisional.end()
   }
   const span = matches ? provisional : ctx.tracer.startSpan(
-    `${ctx.tracePrefix}llm`,
+    llmSpanName(ctx.semconv, d.model.id, ctx.tracePrefix),
     {
       startTime: d.started ?? e.created,
       kind: SpanKind.CLIENT,
@@ -216,31 +184,16 @@ export function handleStepEnded(e: EventOf<"session.step.ended">, ctx: HandlerCo
   const span = ctx.tracing.stepSpans.get(d.assistantMessageID)
   if (span) {
     const output = outputText(d.assistantMessageID, ctx)
-    span.setAttributes({
-      [AGENT_NAME]: agent,
-      "agent.type": agentType,
-      [LLM_TOKEN_COUNT_PROMPT]: d.tokens.input,
-      [LLM_TOKEN_COUNT_COMPLETION]: d.tokens.output,
-      [LLM_TOKEN_COUNT_COMPLETION_DETAILS_REASONING]: d.tokens.reasoning,
-      [LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_READ]: d.tokens.cache.read,
-      [LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_WRITE]: d.tokens.cache.write,
-      [LLM_TOKEN_COUNT_TOTAL]: allTokens(d.tokens),
-      [LLM_FINISH_REASON]: d.finish,
-      [LLM_COST_TOTAL]: d.cost,
-      cost_usd: d.cost,
-      duration_ms: durationMs,
-      ...(ttftMs !== undefined
-        ? {
-            "gen_ai.server.time_to_first_token": ttftMs / 1000,
-            "llm.time_to_first_token_ms": ttftMs,
-          }
-        : {}),
-      ...(output ? {
-        [OUTPUT_VALUE]: output,
-        [OUTPUT_MIME_TYPE]: MimeType.TEXT,
-        [LLM_OUTPUT_MESSAGES]: JSON.stringify([{ role: "assistant", content: output }]),
-      } : {}),
-    })
+    span.setAttributes(llmEndAttrs(ctx.semconv, {
+      agent,
+      agentType,
+      tokens: d.tokens,
+      cost: d.cost,
+      finish: d.finish,
+      durationMs,
+      ttftMs,
+      ...(output ? { output } : {}),
+    }))
     span.setStatus({ code: SpanStatusCode.OK })
     span.end(e.created)
   }
@@ -297,28 +250,16 @@ export function handleStepFailed(e: EventOf<"session.step.failed">, ctx: Handler
   const span = ctx.tracing.stepSpans.get(d.assistantMessageID)
   if (span) {
     const output = outputText(d.assistantMessageID, ctx)
-    span.setAttributes({
-      [AGENT_NAME]: agent,
-      "agent.type": agentType,
-      [LLM_FINISH_REASON]: d.finish ?? "error",
-      duration_ms: durationMs,
-      ...(ttftMs !== undefined
-        ? {
-            "gen_ai.server.time_to_first_token": ttftMs / 1000,
-            "llm.time_to_first_token_ms": ttftMs,
-          }
-        : {}),
-      ...(d.tokens ? {
-        [LLM_TOKEN_COUNT_PROMPT]: d.tokens.input,
-        [LLM_TOKEN_COUNT_COMPLETION]: d.tokens.output,
-        [LLM_TOKEN_COUNT_COMPLETION_DETAILS_REASONING]: d.tokens.reasoning,
-        [LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_READ]: d.tokens.cache.read,
-        [LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_WRITE]: d.tokens.cache.write,
-        [LLM_TOKEN_COUNT_TOTAL]: allTokens(d.tokens),
-      } : {}),
-      ...(d.cost !== undefined ? { [LLM_COST_TOTAL]: d.cost, cost_usd: d.cost } : {}),
-      ...(output ? { [OUTPUT_VALUE]: output, [OUTPUT_MIME_TYPE]: MimeType.TEXT } : {}),
-    })
+    span.setAttributes(llmFailAttrs(ctx.semconv, {
+      agent,
+      agentType,
+      finish: d.finish,
+      durationMs,
+      ttftMs,
+      ...(d.tokens ? { tokens: d.tokens } : {}),
+      ...(d.cost !== undefined ? { cost: d.cost } : {}),
+      ...(output ? { output } : {}),
+    }))
     span.setStatus({ code: SpanStatusCode.ERROR, message: error })
     span.end(e.created)
   }

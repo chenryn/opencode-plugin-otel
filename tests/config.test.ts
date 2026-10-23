@@ -78,6 +78,7 @@ describe("loadConfig", () => {
     "OPENCODE_CAPTURE_MODEL_CONTEXT",
     "OPENCODE_DISABLE_TRACES",
     "OPENCODE_TRACE_PROPAGATION_PROVIDERS",
+    "OPENCODE_SEMCONV",
     "OTEL_EXPORTER_OTLP_HEADERS",
     "OTEL_RESOURCE_ATTRIBUTES",
     "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE",
@@ -105,6 +106,35 @@ describe("loadConfig", () => {
   test("logsEnabled is false when OPENCODE_DISABLE_LOGS is set", () => {
     process.env["OPENCODE_DISABLE_LOGS"] = "1"
     expect(loadConfig().logsEnabled).toBe(false)
+  })
+
+  test("semconv defaults to openinference", () => {
+    expect(loadConfig().semconv).toBe("openinference")
+  })
+
+  test("reads OPENCODE_SEMCONV and accepts common spellings", () => {
+    process.env["OPENCODE_SEMCONV"] = "gen_ai"
+    expect(loadConfig().semconv).toBe("gen_ai")
+    process.env["OPENCODE_SEMCONV"] = "GEN-AI"
+    expect(loadConfig().semconv).toBe("gen_ai")
+  })
+
+  test("an option wins over OPENCODE_SEMCONV", () => {
+    process.env["OPENCODE_SEMCONV"] = "gen_ai"
+    expect(loadConfig({ semconv: "openinference" }).semconv).toBe("openinference")
+  })
+
+  test("falls back to openinference and warns for an unknown flavor", () => {
+    const warnings: string[] = []
+    const original = console.warn
+    console.warn = (message: string) => { warnings.push(String(message)) }
+    try {
+      process.env["OPENCODE_SEMCONV"] = "otlp"
+      expect(loadConfig().semconv).toBe("openinference")
+    } finally {
+      console.warn = original
+    }
+    expect(warnings.some((message) => message.includes("OPENCODE_SEMCONV"))).toBe(true)
   })
 
   test("capturePromptInLogs is true when OPENCODE_CAPTURE_PROMPT_IN_LOGS is set", () => {
@@ -368,6 +398,7 @@ describe("loadConfig options", () => {
     "OPENCODE_DISABLE_LOGS",
     "OPENCODE_DISABLE_TRACES",
     "OPENCODE_TRACE_PROPAGATION_PROVIDERS",
+    "OPENCODE_SEMCONV",
     "OTEL_EXPORTER_OTLP_HEADERS",
     "OTEL_RESOURCE_ATTRIBUTES",
     "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE",

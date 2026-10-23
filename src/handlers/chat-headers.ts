@@ -1,8 +1,9 @@
 import { SpanKind, type Span } from "@opentelemetry/api"
-import { AGENT_NAME, INPUT_MIME_TYPE, INPUT_VALUE, LLM_INPUT_MESSAGES, LLM_MODEL_NAME, LLM_PROVIDER, MimeType, OpenInferenceSpanKind, SemanticConventions, SESSION_ID } from "@arizeai/openinference-semantic-conventions"
-import type { HandlerContext } from "../types.ts"
+import { INPUT_MIME_TYPE, INPUT_VALUE, MimeType } from "@arizeai/openinference-semantic-conventions"
+import type { HandlerContext, MessageEntry } from "../types.ts"
+import { inputMessageAttrs, llmSpanName, llmStartAttrs } from "../semconv.ts"
 import { injectTraceContext } from "../trace-context.ts"
-import { genAiProviderName, isTraceEnabled, resolveRunContext, setBoundedMap } from "../util.ts"
+import { isTraceEnabled, resolveRunContext, setBoundedMap } from "../util.ts"
 
 /** The `session.hook("model.request", ...)` event shape consumed by this handler. */
 export type ModelRequestEvent = {
@@ -32,7 +33,7 @@ function textParts(parts: readonly unknown[]): string {
 
 /** Stores a bounded text-only preview of the primary model-visible request. */
 export function captureModelContext(event: ModelVisibleContextEvent, ctx: HandlerContext): void {
-  const entries = [
+  const entries: MessageEntry[] = [
     ...event.system.slice(-2).map((part) => ({ role: "system", content: textParts([part]) })),
     ...event.messages.slice(-12).map((message) => ({ role: message.role, content: textParts(message.content) })),
   ]
@@ -41,7 +42,7 @@ export function captureModelContext(event: ModelVisibleContextEvent, ctx: Handle
     agent: event.agent,
     providerID: event.model.providerID,
     modelID: event.model.id,
-    inputMessages: JSON.stringify(entries),
+    entries,
     ...(latestUser ? { inputValue: latestUser.content } : {}),
   })
 }
@@ -57,10 +58,10 @@ export function applyModelContext(
 ): void {
   const snapshot = ctx.tracing.modelContexts.get(sessionID)
   if (!snapshot || snapshot.agent !== agent || snapshot.providerID !== model.providerID || snapshot.modelID !== model.id) return
-  span.setAttributes({
-    [LLM_INPUT_MESSAGES]: snapshot.inputMessages,
-    ...(snapshot.inputValue ? { [INPUT_VALUE]: snapshot.inputValue, [INPUT_MIME_TYPE]: MimeType.TEXT } : {}),
-  })
+  span.setAttributes(inputMessageAttrs(ctx.semconv, snapshot.entries))
+  if (ctx.semconv === "openinference" && snapshot.inputValue) {
+    span.setAttributes({ [INPUT_VALUE]: snapshot.inputValue, [INPUT_MIME_TYPE]: MimeType.TEXT })
+  }
   if (!retain) ctx.tracing.modelContexts.delete(sessionID)
 }
 
@@ -75,17 +76,17 @@ export async function handleModelRequest(event: ModelRequestEvent, ctx: HandlerC
   let active = ctx.tracing.activeLlm.get(event.sessionID)
   if (!active) {
     const span = ctx.tracer.startSpan(
-      `${ctx.tracePrefix}llm`,
+      llmSpanName(ctx.semconv, event.model.id, ctx.tracePrefix),
       {
         startTime: Date.now(),
         kind: SpanKind.CLIENT,
         attributes: {
-          [SemanticConventions.OPENINFERENCE_SPAN_KIND]: OpenInferenceSpanKind.LLM,
-          [SESSION_ID]: event.sessionID,
-          [AGENT_NAME]: event.agent,
-          [LLM_MODEL_NAME]: event.model.id,
-          [LLM_PROVIDER]: providerID,
-          "gen_ai.provider.name": genAiProviderName(providerID),
+          ...llmStartAttrs(ctx.semconv, {
+            sessionID: event.sessionID,
+            agent: event.agent,
+            providerID,
+            modelID: event.model.id,
+          }),
           ...ctx.commonAttrs,
         },
       },

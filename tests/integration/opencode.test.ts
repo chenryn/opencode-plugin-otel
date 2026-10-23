@@ -80,3 +80,24 @@ for (const disabled of [false, true]) {
     })
   })
 }
+
+test("exports GenAI semantic conventions over OTLP/JSON when OPENCODE_SEMCONV=gen_ai", async () => {
+  const { received, result } = await runScenario("text", "", "gen_ai")
+  const spans = signalRecords(received["traces"]!, "Spans")
+
+  expect(spans.every(span => attributes(span)["openinference.span.kind"] === undefined)).toBe(true)
+  expect(spans.every(span => Object.keys(attributes(span)).every(key => !key.startsWith("llm.")))).toBe(true)
+
+  const run = spans.find(span => attributes(span)["gen_ai.operation.name"] === "invoke_agent")!
+  expect(String(run["name"])).toBe(`invoke_agent ${attributes(run)["gen_ai.agent.name"]}`)
+  expect(attributes(run)["gen_ai.conversation.id"]).toBe(result["sessionID"])
+
+  const llm = spans.find(span => attributes(span)["gen_ai.operation.name"] === "chat")!
+  expect(String(llm["name"])).toStartWith("chat ")
+  expect(llm["parentSpanId"]).toBe(run["spanId"])
+  expect(attributes(llm)["gen_ai.usage.input_tokens"]).toBe(20)
+  expect(attributes(llm)["gen_ai.usage.output_tokens"]).toBe(5)
+  expect(attributes(llm)["gen_ai.request.model"]).toBe("scripted")
+  expect(attributes(llm)["gen_ai.response.finish_reasons"]).toEqual(["stop"])
+  expect(attributes(llm)["gen_ai.output.messages"]).toContain("Fixture complete.")
+}, 40_000)

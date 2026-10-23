@@ -1,4 +1,5 @@
 import type { HandlerContext, Instruments, TracingState, OpenCodeEvent } from "../src/types.ts"
+import type { SemconvFlavor } from "../src/semconv.ts"
 import type { LogRecord } from "@opentelemetry/api-logs"
 import type { Counter, Histogram, Span, SpanOptions, Tracer, Context, SpanContext, SpanStatus, Attributes } from "@opentelemetry/api"
 import { ROOT_CONTEXT, SpanStatusCode, trace } from "@opentelemetry/api"
@@ -188,6 +189,7 @@ export type MockContext = {
     sessionDuration: SpyHistogram
     sessionToken: SpyHistogram
     sessionCost: SpyHistogram
+    ttft: SpyHistogram
   }
   logger: SpyLogger
   pluginLog: SpyPluginLog
@@ -200,6 +202,7 @@ export function makeCtx(
   disabledTraces: string[] = [],
   logsEnabled = true,
   extraCommonAttrs: Record<string, string> = {},
+  semconv: SemconvFlavor = "openinference",
 ): MockContext {
   const session = makeCounter()
   const token = makeCounter()
@@ -214,6 +217,7 @@ export function makeCtx(
   const sessionDurationHistogram = makeHistogram()
   const sessionTokenHistogram = makeHistogram()
   const sessionCostHistogram = makeHistogram()
+  const ttftHistogram = makeHistogram()
   const logger = makeLogger()
   const pluginLog = makePluginLog()
   const tracer = makeTracer()
@@ -232,6 +236,7 @@ export function makeCtx(
     modelUsageCounter: modelUsage as unknown as Counter,
     retryCounter: retry as unknown as Counter,
     subtaskCounter: subtask as unknown as Counter,
+    ttftHistogram: ttftHistogram as unknown as Histogram,
   }
 
   const ctx: HandlerContext = {
@@ -244,6 +249,7 @@ export function makeCtx(
     commonAttrs: { "project.id": projectID, ...extraCommonAttrs },
     disabledMetrics: new Set(disabledMetrics),
     disabledTraces: new Set(disabledTraces),
+    semconv,
     tracer: tracer as unknown as Tracer,
     tracePrefix: "opencode.",
     rootContext: () => ROOT_CONTEXT,
@@ -254,7 +260,7 @@ export function makeCtx(
   return {
     ctx,
     counters: { session, token, cost, commit, cache, message, modelUsage, retry, subtask },
-    histograms: { tool: toolHistogram, sessionDuration: sessionDurationHistogram, sessionToken: sessionTokenHistogram, sessionCost: sessionCostHistogram },
+    histograms: { tool: toolHistogram, sessionDuration: sessionDurationHistogram, sessionToken: sessionTokenHistogram, sessionCost: sessionCostHistogram, ttft: ttftHistogram },
     logger,
     pluginLog,
     tracer,

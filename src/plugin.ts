@@ -70,6 +70,7 @@ export async function setup(ctx: OpenCodeContext): Promise<() => Promise<void>> 
     metricsInterval: config.metricsInterval,
     logsInterval: config.logsInterval,
     metricPrefix: config.metricPrefix,
+    semconv: config.semconv,
     headersHelperSet: !!config.otlpHeadersHelper,
   })
 
@@ -110,6 +111,7 @@ export async function setup(ctx: OpenCodeContext): Promise<() => Promise<void>> 
     commonAttrs: parseAttributePairs(config.spanAttributes),
     disabledMetrics: config.disabledMetrics,
     disabledTraces: config.disabledTraces,
+    semconv: config.semconv,
     tracer: shared.tracer,
     tracePrefix: config.metricPrefix,
     rootContext: remoteContext ? () => remoteContext : () => ROOT_CONTEXT,

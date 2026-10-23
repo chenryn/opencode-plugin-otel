@@ -8,8 +8,14 @@ export function objects(value: Json | undefined): Payload[] {
 export function attributes(record: Payload): Record<string, Json> {
   return Object.fromEntries(objects(record["attributes"]).map(attribute => {
     const value = attribute["value"] as Payload
-    return [String(attribute["key"]), value["stringValue"] ?? value["boolValue"] ?? value["intValue"] ?? value["doubleValue"] ?? null]
+    const array = value["arrayValue"] as Payload | undefined
+    if (array) return [String(attribute["key"]), objects(array["values"]).map(item => scalar(item))]
+    return [String(attribute["key"]), scalar(value)]
   }))
+}
+
+function scalar(value: Payload): Json {
+  return value["stringValue"] ?? value["boolValue"] ?? value["intValue"] ?? value["doubleValue"] ?? null
 }
 
 export function signalRecords(payloads: Payload[], signal: "Spans" | "Metrics" | "Logs"): Payload[] {

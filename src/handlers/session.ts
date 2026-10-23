@@ -1,16 +1,7 @@
 import { SeverityNumber } from "@opentelemetry/api-logs"
 import { SpanStatusCode } from "@opentelemetry/api"
-import {
-  AGENT_NAME,
-  INPUT_MIME_TYPE,
-  INPUT_VALUE,
-  LLM_INPUT_MESSAGES,
-  MimeType,
-  OpenInferenceSpanKind,
-  SemanticConventions,
-  SESSION_ID,
-} from "@arizeai/openinference-semantic-conventions"
 import type { EventOf, HandlerContext, SessionAgentType, SessionTotals } from "../types.ts"
+import { agentEndAttrs, agentSpanName, agentStartAttrs } from "../semconv.ts"
 import {
   agentAttrs,
   errorSummary,
@@ -22,8 +13,6 @@ import {
   setBoundedMap,
   totalTokens,
 } from "../util.ts"
-
-const OPENINFERENCE_SPAN_KIND = SemanticConventions.OPENINFERENCE_SPAN_KIND
 
 export function handlePromptEnqueued(e: EventOf<"session.inbox.enqueued">, ctx: HandlerContext, capturePrompt: boolean) {
   const { sessionID, inboxID, item } = e.data
@@ -194,22 +183,17 @@ export function handleExecutionStarted(e: EventOf<"session.execution.started">, 
   const promptText = pendingPrompt?.text ?? ""
 
   const span = ctx.tracer.startSpan(
-    `${ctx.tracePrefix}session`,
+    agentSpanName(ctx.semconv, totals?.agent ?? "unknown", ctx.tracePrefix),
     {
       startTime: e.created,
       attributes: {
-        [OPENINFERENCE_SPAN_KIND]: OpenInferenceSpanKind.AGENT,
-        [SESSION_ID]: sessionID,
-        [AGENT_NAME]: totals?.agent ?? "unknown",
-        "agent.type": totals?.agentType ?? "primary",
-        "session.is_subagent": isSubagent,
-        ...(promptText
-          ? {
-              [INPUT_VALUE]: promptText,
-              [INPUT_MIME_TYPE]: MimeType.TEXT,
-              [LLM_INPUT_MESSAGES]: JSON.stringify([{ role: "user", content: promptText }]),
-            }
-          : {}),
+        ...agentStartAttrs(ctx.semconv, {
+          sessionID,
+          agent: totals?.agent ?? "unknown",
+          agentType: totals?.agentType ?? "primary",
+          isSubagent,
+          ...(promptText ? { promptText } : {}),
+        }),
         ...ctx.commonAttrs,
       },
     },
@@ -248,13 +232,10 @@ export function handleExecutionEnded(
   const span = ctx.tracing.runSpans.get(sessionID)
   if (span) {
     if (totals) {
-      span.setAttributes({
-        [AGENT_NAME]: totals.agent,
-        "agent.type": totals.agentType,
-        "session.total_tokens": totals.tokens,
-        "session.total_cost_usd": totals.cost,
-        "session.total_messages": totals.messages,
-      })
+      span.setAttributes(agentEndAttrs(ctx.semconv, totals))
+      // The agent can only be resolved once a step or session lookup lands, which may be
+      // after the run span started. Rename so a gen_ai span is not stuck at "invoke_agent unknown".
+      span.updateName(agentSpanName(ctx.semconv, totals.agent, ctx.tracePrefix))
     }
     if (outcome.type === "failed") {
       const message = errorSummary(outcome.error)

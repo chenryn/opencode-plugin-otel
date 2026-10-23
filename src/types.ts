@@ -2,6 +2,7 @@ import type { Context, Counter, Histogram, Span, SpanContext, Tracer } from "@op
 import type { LogRecord, Logger } from "@opentelemetry/api-logs"
 import type { Plugin } from "@opencode/plugin"
 import type { OtelProviders } from "./otel.ts"
+import type { SemconvFlavor } from "./semconv.ts"
 
 /** Numeric priority map for log levels; higher value = higher severity. */
 export const LEVELS = { debug: 0, info: 1, warn: 2, error: 3 } as const
@@ -120,12 +121,18 @@ export type LlmRequestContext = {
   spanContext: SpanContext
 }
 
+/** A single text-only message retained from the model-visible request, for span attributes. */
+export type MessageEntry = {
+  role: string
+  content: string
+}
+
 /** Bounded model-visible text snapshot awaiting its matching primary request. */
 export type ModelContextSnapshot = {
   agent: string
   providerID: string
   modelID: string
-  inputMessages: string
+  entries: MessageEntry[]
   inputValue?: string
 }
 
@@ -185,6 +192,7 @@ export type HandlerContext = {
   commonAttrs: CommonAttrs
   disabledMetrics: Set<string>
   disabledTraces: Set<string>
+  semconv: SemconvFlavor
   tracer: Tracer
   tracePrefix: string
   rootContext: () => Context

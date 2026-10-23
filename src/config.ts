@@ -1,3 +1,4 @@
+import { DEFAULT_SEMCONV, parseSemconv, SEMCONV_VALUES, type SemconvFlavor } from "./semconv.ts"
 import { LEVELS, type Level } from "./types.ts"
 
 /** Accepted values for `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE`. */
@@ -28,6 +29,7 @@ export type PluginConfig = {
   traceparent: string | undefined
   tracestate: string | undefined
   metricsTemporality: MetricsTemporality | undefined
+  semconv: SemconvFlavor
   disabledMetrics: Set<string>
   disabledTraces: Set<string>
   tracePropagationProviders: Set<string>
@@ -74,6 +76,7 @@ export type OtelPluginOptions = {
   traceparent?: string
   tracestate?: string
   metricsTemporality?: MetricsTemporality
+  semconv?: SemconvFlavor
   disabledMetrics?: string[]
   disabledTraces?: string[]
   tracePropagationProviders?: string[]
@@ -108,6 +111,10 @@ function pickMetricsTemporality(value: unknown): MetricsTemporality | undefined 
   if (typeof value !== "string") return undefined
   const normalized = value.toLowerCase()
   return VALID_TEMPORALITIES.has(normalized as MetricsTemporality) ? (normalized as MetricsTemporality) : undefined
+}
+
+function pickSemconv(value: unknown): SemconvFlavor | undefined {
+  return typeof value === "string" ? parseSemconv(value) : undefined
 }
 
 /** Parses a positive integer from an environment variable, returning `fallback` if absent or invalid. */
@@ -177,6 +184,24 @@ export function loadConfig(options: OtelPluginOptions = {}): PluginConfig {
 
   if (metricsTemporality) process.env["OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE"] = metricsTemporality
 
+  const optionSemconv = pickSemconv(resolvedOptions.semconv)
+  const rawEnvSemconv = pickString(process.env["OPENCODE_SEMCONV"])
+  const envSemconv = parseSemconv(rawEnvSemconv)
+  const semconv = optionSemconv ?? envSemconv ?? DEFAULT_SEMCONV
+
+  if (typeof resolvedOptions.semconv === "string" && !optionSemconv) {
+    console.warn(
+      `[opencode-plugin-otel] Invalid semconv option "${resolvedOptions.semconv}". ` +
+        `Expected one of: ${SEMCONV_VALUES}. Value ignored.`,
+    )
+  }
+  if (rawEnvSemconv && !envSemconv) {
+    console.warn(
+      `[opencode-plugin-otel] Invalid OPENCODE_SEMCONV "${rawEnvSemconv}". ` +
+        `Expected one of: ${SEMCONV_VALUES}. Value ignored.`,
+    )
+  }
+
   if (resourceAttributes) process.env["OTEL_RESOURCE_ATTRIBUTES"] = resourceAttributes
 
   const optionMetrics = pickStringList(resolvedOptions.disabledMetrics)
@@ -212,6 +237,7 @@ export function loadConfig(options: OtelPluginOptions = {}): PluginConfig {
     traceparent,
     tracestate,
     metricsTemporality,
+    semconv,
     disabledMetrics,
     disabledTraces,
     tracePropagationProviders,

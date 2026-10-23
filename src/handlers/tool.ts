@@ -1,20 +1,7 @@
 import { SeverityNumber } from "@opentelemetry/api-logs"
 import { SpanKind, SpanStatusCode } from "@opentelemetry/api"
-import {
-  AGENT_NAME,
-  INPUT_MIME_TYPE,
-  INPUT_VALUE,
-  MimeType,
-  OpenInferenceSpanKind,
-  OUTPUT_MIME_TYPE,
-  OUTPUT_VALUE,
-  SemanticConventions,
-  SESSION_ID,
-  TOOL_ID,
-  TOOL_NAME,
-  TOOL_PARAMETERS,
-} from "@arizeai/openinference-semantic-conventions"
 import type { EventOf, HandlerContext } from "../types.ts"
+import { toolCallAttrs, toolEndAttrs, toolSpanName, toolStartAttrs } from "../semconv.ts"
 import {
   agentAttrs,
   errorSummary,
@@ -26,7 +13,6 @@ import {
   setBoundedMap,
 } from "../util.ts"
 
-const OPENINFERENCE_SPAN_KIND = SemanticConventions.OPENINFERENCE_SPAN_KIND
 const GIT_COMMIT_RE = /\bgit\s+commit(?![-\w])/
 const SHELL_TOOL_RE = /(^|\.)(bash|shell)$/i
 
@@ -62,15 +48,12 @@ export function handleToolCalled(e: EventOf<"session.tool.called">, ctx: Handler
   if (isSubagent) startSubagentSpan(d.id, ctx)
   else {
     const span = ctx.tracer.startSpan(
-      `${ctx.tracePrefix}tool.${meta.tool}`,
+      toolSpanName(ctx.semconv, meta.tool, ctx.tracePrefix),
       {
         startTime: e.created,
         kind: SpanKind.INTERNAL,
         attributes: {
-          [OPENINFERENCE_SPAN_KIND]: OpenInferenceSpanKind.TOOL,
-          [SESSION_ID]: d.sessionID,
-          [TOOL_ID]: d.id,
-          [TOOL_NAME]: meta.tool,
+          ...toolStartAttrs(ctx.semconv, { sessionID: d.sessionID, tool: meta.tool, callID: d.id }),
           ...ctx.commonAttrs,
         },
       },
@@ -81,15 +64,12 @@ export function handleToolCalled(e: EventOf<"session.tool.called">, ctx: Handler
   }
 
   const { agentName, agentType } = getSessionAgentMeta(d.sessionID, ctx)
-  const inputJson = safeJson(d.input)
-  ctx.tracing.toolSpans.get(d.id)?.setAttributes({
-    [TOOL_PARAMETERS]: inputJson,
-    [INPUT_VALUE]: inputJson,
-    [INPUT_MIME_TYPE]: MimeType.JSON,
-    [AGENT_NAME]: agentName,
-    "agent.type": agentType,
-    "tool.provider_executed": isProviderExecuted(d),
-  })
+  ctx.tracing.toolSpans.get(d.id)?.setAttributes(toolCallAttrs(ctx.semconv, {
+    agent: agentName,
+    agentType,
+    inputJson: safeJson(d.input),
+    providerExecuted: isProviderExecuted(d),
+  }))
 }
 
 type ProviderExecution = {
@@ -108,18 +88,19 @@ function startSubagentSpan(callID: string, ctx: HandlerContext) {
   if (ctx.tracing.toolSpans.has(callID) || !isTraceEnabled("tool", ctx)) return
   const { agentName, agentType } = getSessionAgentMeta(meta.sessionID, ctx)
   const span = ctx.tracer.startSpan(
-    `${ctx.tracePrefix}tool.subagent`,
+    toolSpanName(ctx.semconv, "subagent", ctx.tracePrefix),
     {
       startTime: meta.startMs,
       kind: SpanKind.INTERNAL,
       attributes: {
-        [OPENINFERENCE_SPAN_KIND]: OpenInferenceSpanKind.TOOL,
-        [SESSION_ID]: meta.sessionID,
-        [TOOL_ID]: callID,
-        [TOOL_NAME]: "subagent",
-        "subagent.agent": meta.agent ?? "unknown",
-        [AGENT_NAME]: agentName,
-        "agent.type": agentType,
+        ...toolStartAttrs(ctx.semconv, {
+          sessionID: meta.sessionID,
+          tool: "subagent",
+          callID,
+          agent: agentName,
+          agentType,
+          subagent: meta.agent ?? "unknown",
+        }),
         ...ctx.commonAttrs,
       },
     },
@@ -206,15 +187,17 @@ function finishTool(
 
   const span = ctx.tracing.toolSpans.get(callID)
   if (span) {
-    span.setAttributes({ [AGENT_NAME]: agentName, "agent.type": agentType, "tool.success": success })
-    if (output) {
-      span.setAttributes({ [OUTPUT_VALUE]: output, [OUTPUT_MIME_TYPE]: MimeType.TEXT })
-    }
+    span.setAttributes(toolEndAttrs(ctx.semconv, {
+      agent: agentName,
+      agentType,
+      success,
+      sizeBytes,
+      ...(output ? { output } : {}),
+      ...(success ? {} : { error: error ?? "unknown" }),
+    }))
     if (success) {
-      span.setAttribute("tool.result_size_bytes", sizeBytes)
       span.setStatus({ code: SpanStatusCode.OK })
     } else {
-      span.setAttribute("tool.error", error ?? "unknown")
       span.setStatus({ code: SpanStatusCode.ERROR, message: error ?? "unknown" })
     }
     span.end(endMs)
