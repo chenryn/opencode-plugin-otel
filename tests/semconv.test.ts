@@ -14,10 +14,13 @@ import {
   ATTR_GEN_AI_TOOL_CALL_RESULT,
   ATTR_GEN_AI_TOOL_NAME,
   ATTR_GEN_AI_TOOL_TYPE,
+  ATTR_GEN_AI_TOKEN_TYPE,
   ATTR_GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
   ATTR_GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
   ATTR_GEN_AI_USAGE_INPUT_TOKENS,
   ATTR_GEN_AI_USAGE_OUTPUT_TOKENS,
+  METRIC_GEN_AI_CLIENT_OPERATION_DURATION,
+  METRIC_GEN_AI_CLIENT_TOKEN_USAGE,
   METRIC_GEN_AI_SERVER_TIME_TO_FIRST_TOKEN,
 } from "@opentelemetry/semantic-conventions/incubating"
 import {
@@ -26,13 +29,16 @@ import {
   agentStartAttrs,
   DEFAULT_SEMCONV,
   GEN_AI_ATTR,
+  GEN_AI_METRIC,
   inputMessageAttrs,
+  isEventSuppressed,
   llmEndAttrs,
   llmFailAttrs,
   llmSpanName,
   llmStartAttrs,
   parseSemconv,
   promptAttrs,
+  signalAttrs,
   toolCallAttrs,
   toolEndAttrs,
   toolSpanName,
@@ -262,5 +268,86 @@ describe("tool span attributes", () => {
     expect(end["tool.error"]).toBe("boom")
     expect(end["tool.result_size_bytes"]).toBeUndefined()
     expect(end["output.value"]).toBeUndefined()
+  })
+})
+
+describe("metric names", () => {
+  test("match the official GenAI metric constants", () => {
+    expect(GEN_AI_METRIC.tokenUsage).toBe(METRIC_GEN_AI_CLIENT_TOKEN_USAGE)
+    expect(GEN_AI_METRIC.operationDuration).toBe(METRIC_GEN_AI_CLIENT_OPERATION_DURATION)
+    expect(GEN_AI_METRIC.timeToFirstToken).toBe(METRIC_GEN_AI_SERVER_TIME_TO_FIRST_TOKEN)
+  })
+
+  test("are never prefixed", () => {
+    for (const name of Object.values(GEN_AI_METRIC)) expect(name.startsWith("gen_ai.")).toBe(true)
+  })
+
+  test("the token-type attribute matches the convention", () => {
+    expect(GEN_AI_ATTR.usageInputTokens).toBe(ATTR_GEN_AI_USAGE_INPUT_TOKENS)
+    expect(GEN_AI_ATTR.usageOutputTokens).toBe(ATTR_GEN_AI_USAGE_OUTPUT_TOKENS)
+    expect(ATTR_GEN_AI_TOKEN_TYPE).toBe("gen_ai.token.type")
+  })
+})
+
+describe("signal attributes", () => {
+  const identity = { sessionID: "ses_1", agent: "build", agentType: "primary", modelID: "claude-sonnet", providerID: "anthropic", tool: "read" }
+
+  test("openinference keeps the OpenInference names", () => {
+    const attrs = signalAttrs("openinference", identity)
+    expect(attrs["session.id"]).toBe("ses_1")
+    expect(attrs["tool_name"]).toBe("read")
+    expect(attrs["model"]).toBe("claude-sonnet")
+    expect(attrs["provider"]).toBe("anthropic")
+    expect(attrs["agent"]).toBe("build")
+    expect(attrs["gen_ai.conversation.id"]).toBeUndefined()
+  })
+
+  test("gen_ai swaps every key but the join key", () => {
+    const attrs = signalAttrs("gen_ai", identity)
+    expect(attrs["session.id"]).toBe("ses_1")
+    expect(attrs["gen_ai.conversation.id"]).toBe("ses_1")
+    expect(attrs["gen_ai.tool.name"]).toBe("read")
+    expect(attrs["gen_ai.request.model"]).toBe("claude-sonnet")
+    expect(attrs["gen_ai.provider.name"]).toBe("anthropic")
+    expect(attrs["gen_ai.agent.name"]).toBe("build")
+    expect(attrs["tool_name"]).toBeUndefined()
+    expect(attrs["model"]).toBeUndefined()
+    expect(attrs["provider"]).toBeUndefined()
+    expect(attrs["agent"]).toBeUndefined()
+  })
+
+  test("omits absent identity fields", () => {
+    expect(Object.keys(signalAttrs("gen_ai", {}))).toEqual([])
+  })
+})
+
+describe("redundant log events", () => {
+  test("are suppressed only in the gen_ai flavor", () => {
+    for (const name of ["api_request", "api_error", "tool_result", "session.created"]) {
+      expect(isEventSuppressed("gen_ai", name)).toBe(true)
+      expect(isEventSuppressed("openinference", name)).toBe(false)
+    }
+  })
+
+  test("keep every event that a span does not already carry", () => {
+    for (const name of ["user_prompt", "session.idle", "session.error", "tool_decision", "commit", "subtask_invoked"]) {
+      expect(isEventSuppressed("gen_ai", name)).toBe(false)
+    }
+  })
+})
+
+describe("tool content capture", () => {
+  test("gen_ai returns identity only when the input is not captured", () => {
+    const attrs = toolCallAttrs("gen_ai", { agent: "build", agentType: "primary", providerExecuted: false })
+    expect(attrs["gen_ai.tool.call.arguments"]).toBeUndefined()
+    expect(attrs["gen_ai.agent.name"]).toBe("build")
+    expect(attrs["tool.provider_executed"]).toBe(false)
+  })
+
+  test("openinference returns identity only when the input is not captured", () => {
+    const attrs = toolCallAttrs("openinference", { agent: "build", agentType: "primary", providerExecuted: true })
+    expect(attrs["tool.parameters"]).toBeUndefined()
+    expect(attrs["input.value"]).toBeUndefined()
+    expect(attrs["tool.provider_executed"]).toBe(true)
   })
 })

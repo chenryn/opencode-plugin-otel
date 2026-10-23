@@ -27,6 +27,24 @@ describe("multi-location telemetry", () => {
     }
   })
 
+  test("backfills instruments added by a newer build into a reused set", async () => {
+    const config = loadConfig({ enabled: true, endpoint: "http://one:4317" })
+    const key = "__opencode_plugin_otel_shared__"
+    const globals = globalThis as Record<string, unknown>
+    const previous = globals[key]
+    const stale = { sessionCounter: {} }
+    const fake = { configKey: configKey(config), refs: 1, instruments: stale }
+    globals[key] = fake
+    try {
+      const shared = await acquireSharedOtel(config, "2.0.0")
+      expect(shared.instruments.tokenUsageHistogram).toBeDefined()
+      expect(shared.instruments.operationDurationHistogram).toBeDefined()
+      expect(shared.instruments.sessionCounter).toBe(stale.sessionCounter as never)
+    } finally {
+      globals[key] = previous
+    }
+  })
+
   test("attributes observed sessions to their own projects", async () => {
     const { ctx } = makeCtx()
     const base: HandlerContext = { ...ctx, commonAttrs: { team: "platform" } }

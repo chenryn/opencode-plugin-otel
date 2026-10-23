@@ -1,11 +1,10 @@
 import { SeverityNumber } from "@opentelemetry/api-logs"
 import { SpanKind, SpanStatusCode } from "@opentelemetry/api"
 import type { EventOf, HandlerContext, SessionTotals } from "../types.ts"
-import { llmEndAttrs, llmFailAttrs, llmSpanName, llmStartAttrs } from "../semconv.ts"
+import { GEN_AI_METRIC, llmEndAttrs, llmFailAttrs, llmSpanName, llmStartAttrs, signalAttrs } from "../semconv.ts"
 import { ensureSession } from "./session.ts"
 import { applyModelContext } from "./chat-headers.ts"
 import {
-  agentAttrs,
   errorSummary,
   genAiProviderName,
   isMetricEnabled,
@@ -61,7 +60,7 @@ export function handleStepStarted(e: EventOf<"session.step.started">, ctx: Handl
   }
 
   if (!isTraceEnabled("llm", ctx)) return
-  const promptText = ctx.tracing.activePrompts.get(d.sessionID)?.text
+  const promptText = ctx.captureContent ? ctx.tracing.activePrompts.get(d.sessionID)?.text : undefined
   const attributes = {
     ...llmStartAttrs(ctx.semconv, {
       sessionID: d.sessionID,
@@ -151,16 +150,19 @@ function recordTtft(
   const ttftMs = Math.max(0, meta.firstTokenAt - meta.startMs)
   // A config hot-reload can reuse an instrument set created before this metric
   // existed. Skip the histogram rather than failing the whole step handler.
-  if (ctx.instruments.ttftHistogram && isMetricEnabled("gen_ai.server.time_to_first_token", ctx)) {
-    ctx.instruments.ttftHistogram.record(ttftMs / 1000, {
-      ...ctx.commonAttrs,
-      "session.id": sessionID,
-      "gen_ai.operation.name": "chat",
-      "gen_ai.provider.name": genAiProviderName(providerID),
-      "gen_ai.request.model": modelID,
-      model: modelID,
-      agent,
-    })
+  if (ctx.instruments.ttftHistogram && isMetricEnabled(GEN_AI_METRIC.timeToFirstToken, ctx)) {
+    const attrs = ctx.semconv === "gen_ai"
+      ? { ...ctx.commonAttrs, ...signalAttrs("gen_ai", { sessionID, agent, modelID, providerID }), "gen_ai.operation.name": "chat" }
+      : {
+          ...ctx.commonAttrs,
+          "session.id": sessionID,
+          "gen_ai.operation.name": "chat",
+          "gen_ai.provider.name": genAiProviderName(providerID),
+          "gen_ai.request.model": modelID,
+          model: modelID,
+          agent,
+        }
+    ctx.instruments.ttftHistogram.record(ttftMs / 1000, attrs)
   }
   return ttftMs
 }
@@ -177,13 +179,14 @@ export function handleStepEnded(e: EventOf<"session.step.ended">, ctx: HandlerCo
   const durationMs = Math.max(0, e.created - (meta?.startMs ?? e.created))
   const ttftMs = recordTtft(meta, d.sessionID, modelID, providerID, agent, ctx)
 
-  recordUsageMetrics(d.sessionID, modelID, agent, d.tokens, d.cost, ctx)
+  recordUsageMetrics(d.sessionID, modelID, providerID, agent, d.tokens, d.cost, ctx)
+  recordGenAiMetrics(d.sessionID, modelID, providerID, agent, d.tokens, durationMs, undefined, ctx)
   const firstStep = countMessage(d.assistantMessageID, d.sessionID, modelID, providerID, agent, ctx)
   accumulateTotals(d.sessionID, allTokens(d.tokens), d.cost, firstStep, ctx)
 
   const span = ctx.tracing.stepSpans.get(d.assistantMessageID)
   if (span) {
-    const output = outputText(d.assistantMessageID, ctx)
+    const output = ctx.captureContent ? outputText(d.assistantMessageID, ctx) : undefined
     span.setAttributes(llmEndAttrs(ctx.semconv, {
       agent,
       agentType,
@@ -199,7 +202,7 @@ export function handleStepEnded(e: EventOf<"session.step.ended">, ctx: HandlerCo
   }
   cleanupStep(d.assistantMessageID, d.sessionID, ctx)
 
-  ctx.emitLog({
+  ctx.emitEvent({
     severityNumber: SeverityNumber.INFO,
     severityText: "INFO",
     timestamp: e.created,
@@ -211,7 +214,7 @@ export function handleStepEnded(e: EventOf<"session.step.ended">, ctx: HandlerCo
       model: modelID,
       provider: providerID,
       "gen_ai.provider.name": genAiProviderName(providerID),
-      ...agentAttrs(agent, agentType),
+      ...signalAttrs(ctx.semconv, { agent, agentType }),
       cost_usd: d.cost,
       duration_ms: durationMs,
       input_tokens: d.tokens.input,
@@ -243,13 +246,14 @@ export function handleStepFailed(e: EventOf<"session.step.failed">, ctx: Handler
   const durationMs = Math.max(0, e.created - (meta?.startMs ?? e.created))
   const ttftMs = recordTtft(meta, d.sessionID, modelID, providerID, agent, ctx)
 
-  recordUsageMetrics(d.sessionID, modelID, agent, d.tokens, d.cost, ctx)
+  recordUsageMetrics(d.sessionID, modelID, providerID, agent, d.tokens, d.cost, ctx)
+  recordGenAiMetrics(d.sessionID, modelID, providerID, agent, d.tokens, durationMs, d.finish ?? "error", ctx)
   const firstStep = countMessage(d.assistantMessageID, d.sessionID, modelID, providerID, agent, ctx)
   accumulateTotals(d.sessionID, allTokens(d.tokens), d.cost ?? 0, firstStep, ctx)
 
   const span = ctx.tracing.stepSpans.get(d.assistantMessageID)
   if (span) {
-    const output = outputText(d.assistantMessageID, ctx)
+    const output = ctx.captureContent ? outputText(d.assistantMessageID, ctx) : undefined
     span.setAttributes(llmFailAttrs(ctx.semconv, {
       agent,
       agentType,
@@ -265,7 +269,7 @@ export function handleStepFailed(e: EventOf<"session.step.failed">, ctx: Handler
   }
   cleanupStep(d.assistantMessageID, d.sessionID, ctx)
 
-  ctx.emitLog({
+  ctx.emitEvent({
     severityNumber: SeverityNumber.ERROR,
     severityText: "ERROR",
     timestamp: e.created,
@@ -277,7 +281,7 @@ export function handleStepFailed(e: EventOf<"session.step.failed">, ctx: Handler
       model: modelID,
       provider: providerID,
       "gen_ai.provider.name": genAiProviderName(providerID),
-      ...agentAttrs(agent, agentType),
+      ...signalAttrs(ctx.semconv, { agent, agentType }),
       error,
       duration_ms: durationMs,
       ...(ttftMs !== undefined
@@ -294,13 +298,15 @@ export function handleStepFailed(e: EventOf<"session.step.failed">, ctx: Handler
 function recordUsageMetrics(
   sessionID: string,
   modelID: string,
+  providerID: string,
   agent: string,
   tokens: { input: number; output: number; reasoning: number; cache: { read: number; write: number } } | undefined,
   cost: number | undefined,
   ctx: HandlerContext,
 ) {
-  const base = { ...ctx.commonAttrs, "session.id": sessionID, model: modelID, agent }
-  if (tokens && isMetricEnabled("token.usage", ctx)) {
+  const base = { ...ctx.commonAttrs, ...signalAttrs(ctx.semconv, { sessionID, modelID, agent }) }
+  // The `gen_ai` flavor reports token usage through the official histogram instead.
+  if (tokens && ctx.semconv === "openinference" && isMetricEnabled("token.usage", ctx)) {
     const { tokenCounter } = ctx.instruments
     tokenCounter.add(tokens.input, { ...base, type: "input" })
     tokenCounter.add(tokens.output, { ...base, type: "output" })
@@ -317,11 +323,45 @@ function recordUsageMetrics(
   }
   void ctx.log("debug", "otel: step usage recorded", {
     sessionID,
+    provider: providerID,
     model: modelID,
     agent,
     billed: billedTokens(tokens),
     cost_usd: cost,
   })
+}
+
+/**
+ * Records the official GenAI token-usage and operation-duration histograms. No-ops outside
+ * the `gen_ai` flavor, where `opencode.token.usage` remains the token counter.
+ */
+function recordGenAiMetrics(
+  sessionID: string,
+  modelID: string,
+  providerID: string,
+  agent: string,
+  tokens: { input: number; output: number; reasoning: number; cache: { read: number; write: number } } | undefined,
+  durationMs: number,
+  errorType: string | undefined,
+  ctx: HandlerContext,
+) {
+  if (ctx.semconv !== "gen_ai") return
+  const base = {
+    ...ctx.commonAttrs,
+    ...signalAttrs("gen_ai", { sessionID, modelID, providerID, agent }),
+    "gen_ai.operation.name": "chat",
+  }
+  if (tokens && isMetricEnabled(GEN_AI_METRIC.tokenUsage, ctx)) {
+    const { tokenUsageHistogram } = ctx.instruments
+    tokenUsageHistogram.record(tokens.input + tokens.cache.read + tokens.cache.write, { ...base, "gen_ai.token.type": "input" })
+    tokenUsageHistogram.record(tokens.output + tokens.reasoning, { ...base, "gen_ai.token.type": "output" })
+  }
+  if (isMetricEnabled(GEN_AI_METRIC.operationDuration, ctx)) {
+    ctx.instruments.operationDurationHistogram.record(durationMs / 1000, {
+      ...base,
+      ...(errorType ? { "error.type": errorType } : {}),
+    })
+  }
 }
 
 function cleanupStep(assistantMessageID: string, sessionID: string, ctx: HandlerContext) {

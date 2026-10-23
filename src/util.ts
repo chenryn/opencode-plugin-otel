@@ -125,15 +125,6 @@ export function isTraceEnabled(name: string, ctx: { disabledTraces: Set<string> 
   return !ctx.disabledTraces.has(name)
 }
 
-/** Builds a consistent agent attribute set for OTLP logs, metrics, and spans. */
-export function agentAttrs(agentName: string, agentType: SessionAgentType | "unknown") {
-  return {
-    agent: agentName,
-    "agent.name": agentName,
-    "agent.type": agentType,
-  } as const
-}
-
 /** Resolves the trace context for a run span, falling back to the configured root context. */
 export function resolveRunContext(sessionID: string, ctx: HandlerContext): Context {
   const base = ctx.rootContext()

@@ -1,6 +1,7 @@
 import { SeverityNumber } from "@opentelemetry/api-logs"
 import type { EventOf, HandlerContext } from "../types.ts"
-import { agentAttrs, getSessionAgentMeta, setBoundedMap } from "../util.ts"
+import { signalAttrs } from "../semconv.ts"
+import { getSessionAgentMeta, setBoundedMap } from "../util.ts"
 
 /** Stores an answered permission prompt for correlation when the reply arrives. */
 export function handlePermissionAsked(e: EventOf<"permission.asked">, ctx: HandlerContext) {
@@ -25,7 +26,7 @@ export function handlePermissionReplied(e: EventOf<"permission.replied">, ctx: H
   const decision = d.reply === "reject" ? "reject" : "accept"
   const { agentName, agentType } = getSessionAgentMeta(d.sessionID, ctx)
 
-  ctx.emitLog({
+  ctx.emitEvent({
     severityNumber: SeverityNumber.INFO,
     severityText: "INFO",
     timestamp: e.created,
@@ -33,12 +34,10 @@ export function handlePermissionReplied(e: EventOf<"permission.replied">, ctx: H
     body: "tool_decision",
     attributes: {
       "event.name": "tool_decision",
-      "session.id": d.sessionID,
-      tool_name: pending?.action ?? "unknown",
+      ...signalAttrs(ctx.semconv, { sessionID: d.sessionID, agent: agentName, agentType, tool: pending?.action ?? "unknown" }),
       ...(pending ? { resources: pending.resources.join(",") } : {}),
       decision,
       source: d.reply,
-      ...agentAttrs(agentName, agentType),
       ...ctx.commonAttrs,
     },
   })

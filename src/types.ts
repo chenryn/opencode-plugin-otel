@@ -63,6 +63,10 @@ export type Instruments = {
   retryCounter: Counter
   subtaskCounter: Counter
   ttftHistogram: Histogram
+  /** `gen_ai.client.token.usage`; recorded only in the `gen_ai` flavor. */
+  tokenUsageHistogram: Histogram
+  /** `gen_ai.client.operation.duration`; recorded only in the `gen_ai` flavor. */
+  operationDurationHistogram: Histogram
 }
 
 /** Session role emitted by opencode: either the primary/root agent or a spawned subagent. */
@@ -187,12 +191,15 @@ export type TracingState = {
 /** Shared context threaded through every event handler. */
 export type HandlerContext = {
   log: PluginLogger
-  emitLog: (record: LogRecord) => void
+  /** Emits a log event; redundant events are dropped in the `gen_ai` flavor. */
+  emitEvent: (record: LogRecord) => void
   instruments: Instruments
   commonAttrs: CommonAttrs
   disabledMetrics: Set<string>
   disabledTraces: Set<string>
   semconv: SemconvFlavor
+  /** Whether message/tool content may be serialized into spans and logs. */
+  captureContent: boolean
   tracer: Tracer
   tracePrefix: string
   rootContext: () => Context

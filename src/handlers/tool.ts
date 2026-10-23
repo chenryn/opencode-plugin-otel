@@ -1,9 +1,8 @@
 import { SeverityNumber } from "@opentelemetry/api-logs"
 import { SpanKind, SpanStatusCode } from "@opentelemetry/api"
 import type { EventOf, HandlerContext } from "../types.ts"
-import { toolCallAttrs, toolEndAttrs, toolSpanName, toolStartAttrs } from "../semconv.ts"
+import { signalAttrs, toolCallAttrs, toolEndAttrs, toolSpanName, toolStartAttrs } from "../semconv.ts"
 import {
-  agentAttrs,
   errorSummary,
   getSessionAgentMeta,
   isMetricEnabled,
@@ -67,7 +66,7 @@ export function handleToolCalled(e: EventOf<"session.tool.called">, ctx: Handler
   ctx.tracing.toolSpans.get(d.id)?.setAttributes(toolCallAttrs(ctx.semconv, {
     agent: agentName,
     agentType,
-    inputJson: safeJson(d.input),
+    inputJson: ctx.captureContent ? safeJson(d.input) : undefined,
     providerExecuted: isProviderExecuted(d),
   }))
 }
@@ -161,7 +160,7 @@ function finishTool(
     if (isMetricEnabled("commit.count", ctx)) {
       ctx.instruments.commitCounter.add(1, { ...ctx.commonAttrs, "session.id": sessionID })
     }
-    ctx.emitLog({
+    ctx.emitEvent({
       severityNumber: SeverityNumber.INFO,
       severityText: "INFO",
       timestamp: endMs,
@@ -169,8 +168,7 @@ function finishTool(
       body: "commit",
       attributes: {
         "event.name": "commit",
-        "session.id": sessionID,
-        ...agentAttrs(agentName, agentType),
+        ...signalAttrs(ctx.semconv, { sessionID, agent: agentName, agentType }),
         ...ctx.commonAttrs,
       },
     })
@@ -179,8 +177,7 @@ function finishTool(
   if (observedExecution && isMetricEnabled("tool.duration", ctx)) {
     ctx.instruments.toolDurationHistogram.record(durationMs, {
       ...ctx.commonAttrs,
-      "session.id": sessionID,
-      tool_name: tool,
+      ...signalAttrs(ctx.semconv, { sessionID, tool }),
       success,
     })
   }
@@ -192,7 +189,7 @@ function finishTool(
       agentType,
       success,
       sizeBytes,
-      ...(output ? { output } : {}),
+      ...(output && ctx.captureContent ? { output } : {}),
       ...(success ? {} : { error: error ?? "unknown" }),
     }))
     if (success) {
@@ -205,7 +202,7 @@ function finishTool(
   ctx.tracing.toolSpans.delete(callID)
   ctx.tracing.toolSpanContexts.delete(callID)
 
-  ctx.emitLog({
+  ctx.emitEvent({
     severityNumber: success ? SeverityNumber.INFO : SeverityNumber.ERROR,
     severityText: success ? "INFO" : "ERROR",
     timestamp: start,
@@ -213,9 +210,7 @@ function finishTool(
     body: "tool_result",
     attributes: {
       "event.name": "tool_result",
-      "session.id": sessionID,
-      tool_name: tool,
-      ...agentAttrs(agentName, agentType),
+      ...signalAttrs(ctx.semconv, { sessionID, agent: agentName, agentType, tool }),
       success,
       duration_ms: durationMs,
       ...(success ? { tool_result_size_bytes: sizeBytes } : { error: error ?? "unknown" }),

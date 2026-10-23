@@ -1,6 +1,7 @@
 import { ROOT_CONTEXT } from "@opentelemetry/api"
 import pkg from "../package.json" with { type: "json" }
 import { loadConfig, parseAttributePairs, resolveHelperPath, resolveLogLevel, type OtelPluginOptions } from "./config.ts"
+import { isEventSuppressed } from "./semconv.ts"
 import { probeEndpoint } from "./probe.ts"
 import { forceFlushOtel } from "./otel.ts"
 import { remoteParentContext } from "./trace-context.ts"
@@ -94,8 +95,9 @@ export async function setup(ctx: OpenCodeContext): Promise<() => Promise<void>> 
     })
   }
 
-  const emitLog: HandlerContext["emitLog"] = (record) => {
+  const emitEvent: HandlerContext["emitEvent"] = (record) => {
     if (!config.logsEnabled) return
+    if (isEventSuppressed(config.semconv, String(record.body))) return
     shared.logger.emit(record)
   }
 
@@ -106,12 +108,13 @@ export async function setup(ctx: OpenCodeContext): Promise<() => Promise<void>> 
 
   const hctx: HandlerContext = {
     log,
-    emitLog,
+    emitEvent,
     instruments: shared.instruments,
     commonAttrs: parseAttributePairs(config.spanAttributes),
     disabledMetrics: config.disabledMetrics,
     disabledTraces: config.disabledTraces,
     semconv: config.semconv,
+    captureContent: config.semconv === "gen_ai" ? config.captureModelContext : true,
     tracer: shared.tracer,
     tracePrefix: config.metricPrefix,
     rootContext: remoteContext ? () => remoteContext : () => ROOT_CONTEXT,

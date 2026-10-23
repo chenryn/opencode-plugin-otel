@@ -31,7 +31,7 @@ test("exports real OpenCode session telemetry over OTLP/JSON", async () => {
 for (const disabled of [false, true]) {
   describe(`local read with tool tracing ${disabled ? "disabled" : "enabled"}`, () => {
     let scenario: Awaited<ReturnType<typeof runScenario>>
-    beforeAll(async () => { scenario = await runScenario("read", disabled ? "tool" : "") }, 40_000)
+    beforeAll(async () => { scenario = await runScenario("read", { disabledTraces: disabled ? "tool" : "" }) }, 40_000)
 
     test("executes the real read tool and reports its contents to the provider", () => {
       expect(scenario.requests).toHaveLength(2)
@@ -81,23 +81,90 @@ for (const disabled of [false, true]) {
   })
 }
 
-test("exports GenAI semantic conventions over OTLP/JSON when OPENCODE_SEMCONV=gen_ai", async () => {
-  const { received, result } = await runScenario("text", "", "gen_ai")
-  const spans = signalRecords(received["traces"]!, "Spans")
+describe("GenAI semantic conventions", () => {
+  let quiet: Awaited<ReturnType<typeof runScenario>>
+  let verbose: Awaited<ReturnType<typeof runScenario>>
+  beforeAll(async () => {
+    quiet = await runScenario("text", { semconv: "gen_ai" })
+    verbose = await runScenario("text", { semconv: "gen_ai", captureModelContext: true })
+  }, 90_000)
 
-  expect(spans.every(span => attributes(span)["openinference.span.kind"] === undefined)).toBe(true)
-  expect(spans.every(span => Object.keys(attributes(span)).every(key => !key.startsWith("llm.")))).toBe(true)
+  test("replaces every OpenInference attribute with its GenAI equivalent", () => {
+    const spans = signalRecords(quiet.received["traces"]!, "Spans")
+    expect(spans.every(span => attributes(span)["openinference.span.kind"] === undefined)).toBe(true)
+    expect(spans.every(span => Object.keys(attributes(span)).every(key => !key.startsWith("llm.")))).toBe(true)
+    expect(spans.every(span => attributes(span)["gen_ai.operation.name"] !== undefined)).toBe(true)
+  })
 
-  const run = spans.find(span => attributes(span)["gen_ai.operation.name"] === "invoke_agent")!
-  expect(String(run["name"])).toBe(`invoke_agent ${attributes(run)["gen_ai.agent.name"]}`)
-  expect(attributes(run)["gen_ai.conversation.id"]).toBe(result["sessionID"])
+  test("names spans after the GenAI operation and model", () => {
+    const spans = signalRecords(quiet.received["traces"]!, "Spans")
+    const run = spans.find(span => attributes(span)["gen_ai.operation.name"] === "invoke_agent")!
+    expect(String(run["name"])).toBe(`invoke_agent ${attributes(run)["gen_ai.agent.name"]}`)
+    expect(attributes(run)["gen_ai.conversation.id"]).toBe(quiet.result["sessionID"])
 
-  const llm = spans.find(span => attributes(span)["gen_ai.operation.name"] === "chat")!
-  expect(String(llm["name"])).toStartWith("chat ")
-  expect(llm["parentSpanId"]).toBe(run["spanId"])
-  expect(attributes(llm)["gen_ai.usage.input_tokens"]).toBe(20)
-  expect(attributes(llm)["gen_ai.usage.output_tokens"]).toBe(5)
-  expect(attributes(llm)["gen_ai.request.model"]).toBe("scripted")
-  expect(attributes(llm)["gen_ai.response.finish_reasons"]).toEqual(["stop"])
-  expect(attributes(llm)["gen_ai.output.messages"]).toContain("Fixture complete.")
-}, 40_000)
+    const llm = spans.find(span => attributes(span)["gen_ai.operation.name"] === "chat")!
+    expect(String(llm["name"])).toBe("chat scripted")
+    expect(llm["parentSpanId"]).toBe(run["spanId"])
+    expect(attributes(llm)["gen_ai.request.model"]).toBe("scripted")
+    expect(attributes(llm)["gen_ai.usage.input_tokens"]).toBe(20)
+    expect(attributes(llm)["gen_ai.usage.output_tokens"]).toBe(5)
+    expect(attributes(llm)["gen_ai.response.finish_reasons"]).toEqual(["stop"])
+  })
+
+  test("omits the opt-in content attributes by default", () => {
+    const spans = signalRecords(quiet.received["traces"]!, "Spans")
+    for (const span of spans) {
+      expect(attributes(span)["gen_ai.input.messages"]).toBeUndefined()
+      expect(attributes(span)["gen_ai.output.messages"]).toBeUndefined()
+      expect(attributes(span)["input.value"]).toBeUndefined()
+      expect(attributes(span)["output.value"]).toBeUndefined()
+    }
+  })
+
+  test("emits the opt-in content attributes under OPENCODE_CAPTURE_MODEL_CONTEXT", () => {
+    const spans = signalRecords(verbose.received["traces"]!, "Spans")
+    const llm = spans.find(span => attributes(span)["gen_ai.operation.name"] === "chat")!
+    const output = JSON.parse(String(attributes(llm)["gen_ai.output.messages"]))
+    expect(output[0]["role"]).toBe("assistant")
+    expect(output[0]["parts"][0]).toEqual({ type: "text", content: "Fixture complete." })
+    const input = JSON.parse(String(attributes(llm)["gen_ai.input.messages"]))
+    expect(input.map((message: { role: string }) => message["role"])).toContain("user")
+  })
+
+  test("records the official GenAI histograms instead of the OpenInference counters", () => {
+    const metrics = signalRecords(quiet.received["metrics"]!, "Metrics")
+    expect(metricPoints(metrics, "opencode.token.usage", "sum")).toHaveLength(0)
+
+    const usage = metricPoints(metrics, "gen_ai.client.token.usage", "histogram")
+    const typed = (type: string) => usage.filter(point => attributes(point)["gen_ai.token.type"] === type).at(-1)!
+    expect(Number(typed("input")["sum"])).toBe(20)
+    expect(Number(typed("output")["sum"])).toBe(5)
+    expect(attributes(typed("input"))["gen_ai.request.model"]).toBe("scripted")
+    expect(attributes(typed("input"))["gen_ai.conversation.id"]).toBe(quiet.result["sessionID"])
+
+    const duration = metricPoints(metrics, "gen_ai.client.operation.duration", "histogram").at(-1)!
+    expect(Number(duration["count"])).toBe(1)
+    expect(attributes(duration)["gen_ai.operation.name"]).toBe("chat")
+    expect(attributes(duration)["error.type"]).toBeUndefined()
+  })
+
+  test("drops the log events that duplicate a span", () => {
+    const names = signalRecords(quiet.received["logs"]!, "Logs").map(log => String(attributes(log)["event.name"]))
+    for (const redundant of ["api_request", "api_error", "tool_result", "session.created"]) {
+      expect(names).not.toContain(redundant)
+    }
+    expect(names).toContain("user_prompt")
+    expect(names).toContain("session.idle")
+    const prompt = signalRecords(quiet.received["logs"]!, "Logs")
+      .find(log => attributes(log)["event.name"] === "user_prompt")!
+    expect(attributes(prompt)["gen_ai.conversation.id"]).toBe(quiet.result["sessionID"])
+    expect(attributes(prompt)["agent"]).toBeUndefined()
+    expect(attributes(prompt)["prompt"]).toBeUndefined()
+  })
+
+  test("keeps the prompt text on the surviving log event when content capture is on", () => {
+    const prompt = signalRecords(verbose.received["logs"]!, "Logs")
+      .find(log => attributes(log)["event.name"] === "user_prompt")!
+    expect(String(attributes(prompt)["prompt"])).toBeString()
+  })
+})

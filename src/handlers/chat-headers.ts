@@ -58,9 +58,11 @@ export function applyModelContext(
 ): void {
   const snapshot = ctx.tracing.modelContexts.get(sessionID)
   if (!snapshot || snapshot.agent !== agent || snapshot.providerID !== model.providerID || snapshot.modelID !== model.id) return
-  span.setAttributes(inputMessageAttrs(ctx.semconv, snapshot.entries))
-  if (ctx.semconv === "openinference" && snapshot.inputValue) {
-    span.setAttributes({ [INPUT_VALUE]: snapshot.inputValue, [INPUT_MIME_TYPE]: MimeType.TEXT })
+  if (ctx.captureContent) {
+    span.setAttributes(inputMessageAttrs(ctx.semconv, snapshot.entries))
+    if (ctx.semconv === "openinference" && snapshot.inputValue) {
+      span.setAttributes({ [INPUT_VALUE]: snapshot.inputValue, [INPUT_MIME_TYPE]: MimeType.TEXT })
+    }
   }
   if (!retain) ctx.tracing.modelContexts.delete(sessionID)
 }

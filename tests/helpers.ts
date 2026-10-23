@@ -1,5 +1,5 @@
 import type { HandlerContext, Instruments, TracingState, OpenCodeEvent } from "../src/types.ts"
-import type { SemconvFlavor } from "../src/semconv.ts"
+import { isEventSuppressed, type SemconvFlavor } from "../src/semconv.ts"
 import type { LogRecord } from "@opentelemetry/api-logs"
 import type { Counter, Histogram, Span, SpanOptions, Tracer, Context, SpanContext, SpanStatus, Attributes } from "@opentelemetry/api"
 import { ROOT_CONTEXT, SpanStatusCode, trace } from "@opentelemetry/api"
@@ -190,6 +190,8 @@ export type MockContext = {
     sessionToken: SpyHistogram
     sessionCost: SpyHistogram
     ttft: SpyHistogram
+    tokenUsage: SpyHistogram
+    operationDuration: SpyHistogram
   }
   logger: SpyLogger
   pluginLog: SpyPluginLog
@@ -203,6 +205,7 @@ export function makeCtx(
   logsEnabled = true,
   extraCommonAttrs: Record<string, string> = {},
   semconv: SemconvFlavor = "openinference",
+  captureContent = true,
 ): MockContext {
   const session = makeCounter()
   const token = makeCounter()
@@ -218,6 +221,8 @@ export function makeCtx(
   const sessionTokenHistogram = makeHistogram()
   const sessionCostHistogram = makeHistogram()
   const ttftHistogram = makeHistogram()
+  const tokenUsageHistogram = makeHistogram()
+  const operationDurationHistogram = makeHistogram()
   const logger = makeLogger()
   const pluginLog = makePluginLog()
   const tracer = makeTracer()
@@ -237,12 +242,15 @@ export function makeCtx(
     retryCounter: retry as unknown as Counter,
     subtaskCounter: subtask as unknown as Counter,
     ttftHistogram: ttftHistogram as unknown as Histogram,
+    tokenUsageHistogram: tokenUsageHistogram as unknown as Histogram,
+    operationDurationHistogram: operationDurationHistogram as unknown as Histogram,
   }
 
   const ctx: HandlerContext = {
     log: pluginLog.fn,
-    emitLog: (record) => {
+    emitEvent: (record) => {
       if (!logsEnabled) return
+      if (isEventSuppressed(semconv, String(record.body))) return
       logger.emit(record)
     },
     instruments,
@@ -250,6 +258,7 @@ export function makeCtx(
     disabledMetrics: new Set(disabledMetrics),
     disabledTraces: new Set(disabledTraces),
     semconv,
+    captureContent,
     tracer: tracer as unknown as Tracer,
     tracePrefix: "opencode.",
     rootContext: () => ROOT_CONTEXT,
@@ -260,7 +269,15 @@ export function makeCtx(
   return {
     ctx,
     counters: { session, token, cost, commit, cache, message, modelUsage, retry, subtask },
-    histograms: { tool: toolHistogram, sessionDuration: sessionDurationHistogram, sessionToken: sessionTokenHistogram, sessionCost: sessionCostHistogram, ttft: ttftHistogram },
+    histograms: {
+      tool: toolHistogram,
+      sessionDuration: sessionDurationHistogram,
+      sessionToken: sessionTokenHistogram,
+      sessionCost: sessionCostHistogram,
+      ttft: ttftHistogram,
+      tokenUsage: tokenUsageHistogram,
+      operationDuration: operationDurationHistogram,
+    },
     logger,
     pluginLog,
     tracer,

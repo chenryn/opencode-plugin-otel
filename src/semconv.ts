@@ -99,6 +99,71 @@ const OP_CHAT = "chat"
 const OP_EXECUTE_TOOL = "execute_tool"
 const OP_INVOKE_AGENT = "invoke_agent"
 
+/**
+ * Metric names from the OpenTelemetry GenAI semantic conventions emitted by the `gen_ai`
+ * flavor. They are never prefixed: a prefixed name would no longer match the convention.
+ */
+export const GEN_AI_METRIC = {
+  tokenUsage: "gen_ai.client.token.usage",
+  operationDuration: "gen_ai.client.operation.duration",
+  timeToFirstToken: "gen_ai.server.time_to_first_token",
+} as const
+
+/**
+ * Log events that duplicate information already carried by a span. They are suppressed in
+ * the `gen_ai` flavor so a backend counting both signals does not double count requests,
+ * tool calls, or sessions. The `openinference` flavor keeps emitting them for compatibility
+ * with existing Claude-Code-style dashboards and alerts.
+ */
+const REDUNDANT_EVENTS: ReadonlySet<string> = new Set([
+  "api_request",
+  "api_error",
+  "tool_result",
+  "session.created",
+])
+
+/** Returns `true` when the log event is redundant with a span and must not be emitted. */
+export function isEventSuppressed(flavor: SemconvFlavor, eventName: string): boolean {
+  return flavor === "gen_ai" && REDUNDANT_EVENTS.has(eventName)
+}
+
+/** Identity attributes shared by log events and metric data points. */
+export type SignalIdentity = {
+  sessionID?: string
+  agent?: string
+  agentType?: string
+  modelID?: string
+  providerID?: string
+  tool?: string
+}
+
+/**
+ * Builds the identity attributes for a log event or metric data point. `session.id` is kept
+ * in both flavors as the cross-signal join key; every other key is swapped for its GenAI
+ * equivalent so a GenAI-native backend can group without a translation layer.
+ */
+export function signalAttrs(flavor: SemconvFlavor, input: SignalIdentity): Attributes {
+  const attrs: Attributes = {}
+  if (input.sessionID) attrs[SESSION_ID] = input.sessionID
+  if (input.tool) attrs[flavor === "gen_ai" ? GEN_AI_ATTR.toolName : "tool_name"] = input.tool
+  if (input.modelID) attrs[flavor === "gen_ai" ? GEN_AI_ATTR.requestModel : "model"] = input.modelID
+  if (input.providerID) {
+    attrs[flavor === "gen_ai" ? GEN_AI_ATTR.providerName : "provider"] = flavor === "gen_ai"
+      ? genAiProviderName(input.providerID)
+      : input.providerID
+  }
+  if (input.agent) {
+    if (flavor === "gen_ai") attrs[GEN_AI_ATTR.agentName] = input.agent
+    else {
+      attrs["agent"] = input.agent
+      attrs[AGENT_NAME] = input.agent
+    }
+  }
+  if (input.agentType) attrs["agent.type"] = input.agentType
+  if (input.sessionID && flavor === "gen_ai") attrs[GEN_AI_ATTR.conversationID] = input.sessionID
+  return attrs
+}
+
 /** Agent identity attributes for the active flavor. */
 function agentNameAttrs(flavor: SemconvFlavor, agent: string): Attributes {
   return flavor === "gen_ai" ? { [GEN_AI_ATTR.agentName]: agent } : { [AGENT_NAME]: agent }
@@ -408,7 +473,7 @@ export function toolStartAttrs(flavor: SemconvFlavor, input: ToolSpanInput): Att
 export type ToolCallInput = {
   agent: string
   agentType: string
-  inputJson: string
+  inputJson?: string
   providerExecuted: boolean
 }
 
@@ -419,6 +484,7 @@ export function toolCallAttrs(flavor: SemconvFlavor, input: ToolCallInput): Attr
     "agent.type": input.agentType,
     "tool.provider_executed": input.providerExecuted,
   }
+  if (!input.inputJson) return shared
   return flavor === "gen_ai"
     ? { ...shared, [GEN_AI_ATTR.toolCallArguments]: input.inputJson }
     : { ...shared, [TOOL_PARAMETERS]: input.inputJson, [INPUT_VALUE]: input.inputJson, [INPUT_MIME_TYPE]: MimeType.JSON }

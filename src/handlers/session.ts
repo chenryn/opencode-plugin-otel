@@ -1,9 +1,8 @@
 import { SeverityNumber } from "@opentelemetry/api-logs"
 import { SpanStatusCode } from "@opentelemetry/api"
 import type { EventOf, HandlerContext, SessionAgentType, SessionTotals } from "../types.ts"
-import { agentEndAttrs, agentSpanName, agentStartAttrs } from "../semconv.ts"
+import { agentEndAttrs, agentSpanName, agentStartAttrs, signalAttrs } from "../semconv.ts"
 import {
-  agentAttrs,
   errorSummary,
   isMetricEnabled,
   isTraceEnabled,
@@ -34,7 +33,7 @@ export function handlePromptEnqueued(e: EventOf<"session.inbox.enqueued">, ctx: 
     setBoundedMap(ctx.tracing.pendingPrompts, sessionID, queue)
   }
   const totals = ctx.tracing.sessionTotals.get(sessionID)
-  ctx.emitLog({
+  ctx.emitEvent({
     severityNumber: SeverityNumber.INFO,
     severityText: "INFO",
     timestamp: e.created,
@@ -42,11 +41,10 @@ export function handlePromptEnqueued(e: EventOf<"session.inbox.enqueued">, ctx: 
     body: "user_prompt",
     attributes: {
       "event.name": "user_prompt",
-      "session.id": sessionID,
+      ...signalAttrs(ctx.semconv, { sessionID, ...(totals ? { agent: totals.agent, agentType: totals.agentType } : {}) }),
       "message.id": inboxID,
-      ...(totals ? agentAttrs(totals.agent, totals.agentType) : {}),
       prompt_length: text.length,
-      ...(capturePrompt ? { prompt: text } : {}),
+      ...(capturePrompt && ctx.captureContent ? { prompt: text } : {}),
       delivery: item.delivery,
       ...ctx.commonAttrs,
     },
@@ -59,7 +57,7 @@ function countSession(sessionID: string, isSubagent: boolean, ctx: HandlerContex
   if (isMetricEnabled("session.count", ctx)) {
     ctx.instruments.sessionCounter.add(1, {
       ...ctx.commonAttrs,
-      "session.id": sessionID,
+      ...signalAttrs(ctx.semconv, { sessionID }),
       is_subagent: isSubagent,
     })
   }
@@ -107,12 +105,11 @@ export function handleSessionCreated(e: EventOf<"session.created">, ctx: Handler
   if (isSubagent && isMetricEnabled("subtask.count", ctx)) {
     ctx.instruments.subtaskCounter.add(1, {
       ...ctx.commonAttrs,
-      "session.id": d.sessionID,
-      "agent.type": "subagent",
+      ...signalAttrs(ctx.semconv, { sessionID: d.sessionID, agentType: "subagent" }),
     })
   }
   if (isSubagent) {
-    ctx.emitLog({
+    ctx.emitEvent({
       severityNumber: SeverityNumber.INFO,
       severityText: "INFO",
       timestamp: e.created,
@@ -120,9 +117,8 @@ export function handleSessionCreated(e: EventOf<"session.created">, ctx: Handler
       body: "subtask_invoked",
       attributes: {
         "event.name": "subtask_invoked",
-        "session.id": d.sessionID,
+        ...signalAttrs(ctx.semconv, { sessionID: d.sessionID, agent, agentType }),
         "parent.session.id": d.parentID,
-        ...agentAttrs(agent, agentType),
         ...ctx.commonAttrs,
       },
     })
@@ -138,7 +134,7 @@ export function handleSessionCreated(e: EventOf<"session.created">, ctx: Handler
     ...(d.parentID ? { parentID: d.parentID } : {}),
   })
 
-  ctx.emitLog({
+  ctx.emitEvent({
     severityNumber: SeverityNumber.INFO,
     severityText: "INFO",
     timestamp: e.created,
@@ -146,9 +142,8 @@ export function handleSessionCreated(e: EventOf<"session.created">, ctx: Handler
     body: "session.created",
     attributes: {
       "event.name": "session.created",
-      "session.id": d.sessionID,
+      ...signalAttrs(ctx.semconv, { sessionID: d.sessionID, agent, agentType }),
       is_subagent: isSubagent,
-      ...agentAttrs(agent, agentType),
       ...(d.model ? { model: modelRef(d.model) } : {}),
       ...ctx.commonAttrs,
     },
@@ -180,7 +175,7 @@ export function handleExecutionStarted(e: EventOf<"session.execution.started">, 
   const parentCtx = isSubagent && totals?.parentID
     ? resolveSubagentTraceContext(sessionID, totals.parentID, totals.agent, ctx)
     : ctx.rootContext()
-  const promptText = pendingPrompt?.text ?? ""
+  const promptText = ctx.captureContent ? pendingPrompt?.text ?? "" : ""
 
   const span = ctx.tracer.startSpan(
     agentSpanName(ctx.semconv, totals?.agent ?? "unknown", ctx.tracePrefix),
@@ -254,7 +249,7 @@ export function handleExecutionEnded(
 
   if (outcome.type === "failed") {
     const message = errorSummary(outcome.error)
-    ctx.emitLog({
+    ctx.emitEvent({
       severityNumber: SeverityNumber.ERROR,
       severityText: "ERROR",
       timestamp: e.created,
@@ -262,9 +257,12 @@ export function handleExecutionEnded(
       body: "session.error",
       attributes: {
         "event.name": "session.error",
-        "session.id": sessionID,
+        ...signalAttrs(ctx.semconv, {
+          sessionID,
+          agent: totals?.agent ?? "unknown",
+          agentType: totals?.agentType ?? "unknown",
+        }),
         error: message,
-        ...agentAttrs(totals?.agent ?? "unknown", totals?.agentType ?? "unknown"),
         ...ctx.commonAttrs,
       },
     })
@@ -338,7 +336,7 @@ export function finalizeSession(sessionID: string, ctx: HandlerContext) {
   ctx.tracing.activePrompts.delete(sessionID)
   ctx.tracing.activeExecutions.delete(sessionID)
 
-  const attrs = { ...ctx.commonAttrs, "session.id": sessionID }
+  const attrs = { ...ctx.commonAttrs, ...signalAttrs(ctx.semconv, { sessionID }) }
   const durationMs = Date.now() - totals.startMs
   if (isMetricEnabled("session.duration", ctx)) {
     ctx.instruments.sessionDurationHistogram.record(durationMs, attrs)
@@ -350,7 +348,7 @@ export function finalizeSession(sessionID: string, ctx: HandlerContext) {
     ctx.instruments.sessionCostHistogram.record(totals.cost, attrs)
   }
 
-  ctx.emitLog({
+  ctx.emitEvent({
     severityNumber: SeverityNumber.INFO,
     severityText: "INFO",
     timestamp: Date.now(),
@@ -358,11 +356,10 @@ export function finalizeSession(sessionID: string, ctx: HandlerContext) {
     body: "session.idle",
     attributes: {
       "event.name": "session.idle",
-      "session.id": sessionID,
+      ...signalAttrs(ctx.semconv, { sessionID, agent: totals.agent, agentType: totals.agentType }),
       total_tokens: totals.tokens,
       total_cost_usd: totals.cost,
       total_messages: totals.messages,
-      ...agentAttrs(totals.agent, totals.agentType),
       ...ctx.commonAttrs,
     },
   })
