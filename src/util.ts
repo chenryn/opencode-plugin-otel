@@ -62,6 +62,17 @@ export function setBoundedMap<K, V>(map: Map<K, V>, key: K, value: V) {
   map.set(key, value)
 }
 
+/**
+ * Records the earliest streamed output timestamp for an in-flight LLM step.
+ * Text, reasoning, and tool-input events all count as the first model output.
+ */
+export function recordFirstToken(assistantMessageID: string, at: number, ctx: HandlerContext) {
+  const meta = ctx.tracing.stepMeta.get(assistantMessageID)
+  if (!meta) return
+  const firstTokenAt = Math.min(meta.firstTokenAt ?? at, at)
+  setBoundedMap(ctx.tracing.stepMeta, assistantMessageID, { ...meta, firstTokenAt })
+}
+
 /** Records an event id for de-duplication, evicting the oldest entry when at capacity. */
 export function markSeen(seen: TracingState["seenEvents"], id: string): void {
   if (!seen.has(id) && seen.size >= MAX_SEEN_EVENTS) {

@@ -33,6 +33,7 @@ import {
   isMetricEnabled,
   isTraceEnabled,
   markSeen,
+  recordFirstToken,
   resolveRunContext,
   setBoundedMap,
 } from "../util.ts"
@@ -134,6 +135,16 @@ export function handleStepStarted(e: EventOf<"session.step.started">, ctx: Handl
   })
 }
 
+/** Records the first streamed text token for the active LLM step. */
+export function handleTextStarted(e: EventOf<"session.text.started">, ctx: HandlerContext) {
+  recordFirstToken(e.data.assistantMessageID, e.created, ctx)
+}
+
+/** Records the first streamed reasoning token for the active LLM step. */
+export function handleReasoningStarted(e: EventOf<"session.reasoning.started">, ctx: HandlerContext) {
+  recordFirstToken(e.data.assistantMessageID, e.created, ctx)
+}
+
 export function handleTextEnded(e: EventOf<"session.text.ended">, ctx: HandlerContext) {
   const { assistantMessageID, ordinal, text } = e.data
   const output = ctx.tracing.stepOutputs.get(assistantMessageID) ?? new Map<number, string>()
@@ -159,6 +170,33 @@ function outputText(messageID: string, ctx: HandlerContext): string | undefined 
   return [...output].sort(([a], [b]) => a - b).map(([, text]) => text).join("\n").slice(0, 64_000)
 }
 
+/** Records the TTFT histogram and returns the latency in milliseconds for span attributes. */
+function recordTtft(
+  meta: { startMs: number; firstTokenAt?: number } | undefined,
+  sessionID: string,
+  modelID: string,
+  providerID: string,
+  agent: string,
+  ctx: HandlerContext,
+): number | undefined {
+  if (meta?.firstTokenAt === undefined) return undefined
+  const ttftMs = Math.max(0, meta.firstTokenAt - meta.startMs)
+  // A config hot-reload can reuse an instrument set created before this metric
+  // existed. Skip the histogram rather than failing the whole step handler.
+  if (ctx.instruments.ttftHistogram && isMetricEnabled("gen_ai.server.time_to_first_token", ctx)) {
+    ctx.instruments.ttftHistogram.record(ttftMs / 1000, {
+      ...ctx.commonAttrs,
+      "session.id": sessionID,
+      "gen_ai.operation.name": "chat",
+      "gen_ai.provider.name": genAiProviderName(providerID),
+      "gen_ai.request.model": modelID,
+      model: modelID,
+      agent,
+    })
+  }
+  return ttftMs
+}
+
 /** Records token/cost/cache metrics for a completed step and emits an `api_request` log. */
 export function handleStepEnded(e: EventOf<"session.step.ended">, ctx: HandlerContext) {
   const d = e.data
@@ -169,6 +207,7 @@ export function handleStepEnded(e: EventOf<"session.step.ended">, ctx: HandlerCo
   const modelID = meta?.modelID ?? "unknown"
   const providerID = meta?.providerID ?? "unknown"
   const durationMs = Math.max(0, e.created - (meta?.startMs ?? e.created))
+  const ttftMs = recordTtft(meta, d.sessionID, modelID, providerID, agent, ctx)
 
   recordUsageMetrics(d.sessionID, modelID, agent, d.tokens, d.cost, ctx)
   const firstStep = countMessage(d.assistantMessageID, d.sessionID, modelID, providerID, agent, ctx)
@@ -190,6 +229,12 @@ export function handleStepEnded(e: EventOf<"session.step.ended">, ctx: HandlerCo
       [LLM_COST_TOTAL]: d.cost,
       cost_usd: d.cost,
       duration_ms: durationMs,
+      ...(ttftMs !== undefined
+        ? {
+            "gen_ai.server.time_to_first_token": ttftMs / 1000,
+            "llm.time_to_first_token_ms": ttftMs,
+          }
+        : {}),
       ...(output ? {
         [OUTPUT_VALUE]: output,
         [OUTPUT_MIME_TYPE]: MimeType.TEXT,
@@ -221,6 +266,12 @@ export function handleStepEnded(e: EventOf<"session.step.ended">, ctx: HandlerCo
       reasoning_tokens: d.tokens.reasoning,
       cache_read_tokens: d.tokens.cache.read,
       cache_creation_tokens: d.tokens.cache.write,
+      ...(ttftMs !== undefined
+        ? {
+            "gen_ai.server.time_to_first_token": ttftMs / 1000,
+            time_to_first_token_ms: ttftMs,
+          }
+        : {}),
       ...ctx.commonAttrs,
     },
   })
@@ -237,6 +288,7 @@ export function handleStepFailed(e: EventOf<"session.step.failed">, ctx: Handler
   const providerID = meta?.providerID ?? "unknown"
   const error = errorSummary(d.error)
   const durationMs = Math.max(0, e.created - (meta?.startMs ?? e.created))
+  const ttftMs = recordTtft(meta, d.sessionID, modelID, providerID, agent, ctx)
 
   recordUsageMetrics(d.sessionID, modelID, agent, d.tokens, d.cost, ctx)
   const firstStep = countMessage(d.assistantMessageID, d.sessionID, modelID, providerID, agent, ctx)
@@ -250,6 +302,12 @@ export function handleStepFailed(e: EventOf<"session.step.failed">, ctx: Handler
       "agent.type": agentType,
       [LLM_FINISH_REASON]: d.finish ?? "error",
       duration_ms: durationMs,
+      ...(ttftMs !== undefined
+        ? {
+            "gen_ai.server.time_to_first_token": ttftMs / 1000,
+            "llm.time_to_first_token_ms": ttftMs,
+          }
+        : {}),
       ...(d.tokens ? {
         [LLM_TOKEN_COUNT_PROMPT]: d.tokens.input,
         [LLM_TOKEN_COUNT_COMPLETION]: d.tokens.output,
@@ -281,6 +339,12 @@ export function handleStepFailed(e: EventOf<"session.step.failed">, ctx: Handler
       ...agentAttrs(agent, agentType),
       error,
       duration_ms: durationMs,
+      ...(ttftMs !== undefined
+        ? {
+            "gen_ai.server.time_to_first_token": ttftMs / 1000,
+            time_to_first_token_ms: ttftMs,
+          }
+        : {}),
       ...ctx.commonAttrs,
     },
   })

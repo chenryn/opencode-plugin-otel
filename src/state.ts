@@ -47,6 +47,12 @@ export async function acquireSharedOtel(config: PluginConfig, version: string): 
   const existing = g[OTEL_KEY] as SharedOtel | undefined
   if (existing) {
     if (existing.configKey !== key) throw new Error("OpenCode OTel plugin instances must use identical telemetry configuration within one process")
+    // A hot-reloaded plugin can reuse an instrument set created by an older
+    // build. Backfill instruments added since then instead of dropping their
+    // measurements until the process restarts.
+    if (!existing.instruments.ttftHistogram) {
+      existing.instruments.ttftHistogram = createInstruments(config.metricPrefix).ttftHistogram
+    }
     existing.refs += 1
     return existing
   }

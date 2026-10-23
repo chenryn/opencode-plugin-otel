@@ -21,6 +21,7 @@ import {
   getSessionAgentMeta,
   isMetricEnabled,
   isTraceEnabled,
+  recordFirstToken,
   resolveStepContext,
   setBoundedMap,
 } from "../util.ts"
@@ -34,6 +35,7 @@ type ToolContent = { type: "text"; text: string } | { type: "file"; uri: string;
 /** Records the tool name for correlation with its execution and terminal events. */
 export function handleToolInputStarted(e: EventOf<"session.tool.input.started">, ctx: HandlerContext) {
   const d = e.data
+  recordFirstToken(d.assistantMessageID, e.created, ctx)
   setBoundedMap(ctx.tracing.toolMeta, d.id, {
     sessionID: d.sessionID,
     assistantMessageID: d.assistantMessageID,

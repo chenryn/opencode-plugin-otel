@@ -61,6 +61,7 @@ export type Instruments = {
   modelUsageCounter: Counter
   retryCounter: Counter
   subtaskCounter: Counter
+  ttftHistogram: Histogram
 }
 
 /** Session role emitted by opencode: either the primary/root agent or a spawned subagent. */
@@ -91,6 +92,8 @@ export type SessionIdentity = {
 export type StepMeta = {
   sessionID: string
   startMs: number
+  /** Timestamp of the earliest streamed output part (text, reasoning, or tool input). */
+  firstTokenAt?: number
   agent: string
   agentType: SessionAgentType | "unknown"
   modelID: string

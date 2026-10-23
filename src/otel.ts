@@ -232,5 +232,12 @@ export function createInstruments(prefix: string): Instruments {
       unit: "{subtask}",
       description: "Number of sub-agent sessions observed via session.created with a parentID",
     }),
+    ttftHistogram: meter.createHistogram("gen_ai.server.time_to_first_token", {
+      unit: "s",
+      description: "Time from the model request start to the first streamed output token",
+      advice: {
+        explicitBucketBoundaries: [0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 40, 60, 120],
+      },
+    }),
   }
 }

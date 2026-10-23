@@ -19,7 +19,14 @@ import {
   handleSessionStatus,
   handleUsageUpdated,
 } from "./handlers/session.ts"
-import { handleStepEnded, handleStepFailed, handleStepStarted, handleTextEnded } from "./handlers/step.ts"
+import {
+  handleReasoningStarted,
+  handleStepEnded,
+  handleStepFailed,
+  handleStepStarted,
+  handleTextEnded,
+  handleTextStarted,
+} from "./handlers/step.ts"
 import { handleToolCalled, handleToolFailed, handleToolInputStarted, handleToolProgress, handleToolSuccess } from "./handlers/tool.ts"
 import { handlePermissionAsked, handlePermissionReplied } from "./handlers/permission.ts"
 import { captureModelContext, handleModelRequest } from "./handlers/chat-headers.ts"
@@ -200,6 +207,12 @@ export async function setup(ctx: OpenCodeContext): Promise<() => Promise<void>> 
         break
       case "session.step.started":
         handleStepStarted(event, eventCtx)
+        break
+      case "session.text.started":
+        handleTextStarted(event, eventCtx)
+        break
+      case "session.reasoning.started":
+        handleReasoningStarted(event, eventCtx)
         break
       case "session.text.ended":
         handleTextEnded(event, eventCtx)
