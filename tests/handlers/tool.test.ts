@@ -2,7 +2,7 @@ import { describe, test, expect } from "bun:test"
 import { SpanStatusCode } from "@opentelemetry/api"
 import { handleToolCalled, handleToolFailed, handleToolInputStarted, handleToolSuccess } from "../../src/handlers/tool.ts"
 import { handleExecutionStarted, handleSessionCreated } from "../../src/handlers/session.ts"
-import { makeCtx, evt } from "../helpers.ts"
+import { makeCtx, evt, recordSpanContext } from "../helpers.ts"
 
 function seed(ctx: ReturnType<typeof makeCtx>["ctx"], sessionID = "ses_1") {
   handleSessionCreated(evt("session.created", { sessionID, agent: "build" }), ctx)
@@ -51,6 +51,8 @@ describe("handleToolCalled", () => {
     expect(counters.commit.calls).toHaveLength(1)
     expect(logger.records.some((record) => record.body === "commit")).toBe(true)
     const span = tracer.spans.find((s) => s.name === "opencode.tool.shell")!
+    const commit = logger.records.find((record) => record.body === "commit")!
+    expect(recordSpanContext(commit)).toEqual(span.spanContext())
     expect(span.attributes["input.value"]).toContain("git commit")
     expect(span.attributes["tool.provider_executed"]).toBe(false)
   })
@@ -92,6 +94,7 @@ describe("handleToolSuccess", () => {
     expect(span.endTime).toBe(1250)
     expect(span.status.code).toBe(SpanStatusCode.OK)
     expect(span.attributes["output.value"]).toBe("file body")
+    expect(recordSpanContext(record)).toEqual(span.spanContext())
   })
 
   test("records a provider-executed tool", () => {

@@ -51,7 +51,7 @@ export async function acquireSharedOtel(config: PluginConfig, version: string): 
     // build. Backfill instruments added since then instead of dropping their
     // measurements until the process restarts.
     if (existing.instruments && !existing.instruments.operationDurationHistogram) {
-      existing.instruments = { ...createInstruments(config.metricPrefix), ...existing.instruments }
+      existing.instruments = { ...createInstruments(config.metricPrefix, version), ...existing.instruments }
     }
     existing.refs += 1
     return existing
@@ -72,9 +72,9 @@ export async function acquireSharedOtel(config: PluginConfig, version: string): 
       )
       const shared: SharedOtel = {
         providers,
-        instruments: createInstruments(config.metricPrefix),
-        logger: logs.getLogger("com.opencode"),
-        tracer: trace.getTracer("com.opencode"),
+        instruments: createInstruments(config.metricPrefix, version),
+        logger: logs.getLogger("com.opencode", version),
+        tracer: trace.getTracer("com.opencode", version),
         refs: 0,
         configKey: key,
       }

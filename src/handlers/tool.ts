@@ -149,6 +149,7 @@ function finishTool(
 ) {
   const meta = ctx.tracing.toolMeta.get(callID)
   ctx.tracing.toolMeta.delete(callID)
+  const spanContext = ctx.tracing.toolSpanContexts.get(callID)
   const tool = meta?.tool ?? "unknown"
   const observedExecution = meta?.executionStarted === true
   const start = observedExecution ? meta.startMs : endMs
@@ -171,7 +172,7 @@ function finishTool(
         ...signalAttrs(ctx.semconv, { sessionID, agent: agentName, agentType }),
         ...ctx.commonAttrs,
       },
-    })
+    }, spanContext)
   }
 
   if (observedExecution && isMetricEnabled("tool.duration", ctx)) {
@@ -216,7 +217,7 @@ function finishTool(
       ...(success ? { tool_result_size_bytes: sizeBytes } : { error: error ?? "unknown" }),
       ...ctx.commonAttrs,
     },
-  })
+  }, spanContext)
 }
 
 function contentText(content: readonly ToolContent[] | undefined): string {

@@ -2,7 +2,7 @@ import { describe, test, expect } from "bun:test"
 import { SpanStatusCode } from "@opentelemetry/api"
 import { handleStepEnded, handleStepFailed, handleStepStarted, handleTextEnded } from "../../src/handlers/step.ts"
 import { handleExecutionStarted, handleSessionCreated } from "../../src/handlers/session.ts"
-import { makeCtx, evt, tokens } from "../helpers.ts"
+import { makeCtx, evt, recordSpanContext, tokens } from "../helpers.ts"
 
 function seedSession(ctx: ReturnType<typeof makeCtx>["ctx"], sessionID = "ses_1") {
   handleSessionCreated(evt("session.created", { sessionID, agent: "build" }), ctx)
@@ -57,6 +57,7 @@ describe("handleStepEnded", () => {
     expect(llm.attributes["llm.token_count.total"]).toBe(20)
     expect(llm.attributes["output.value"]).toBe("hello\nworld")
     expect(llm.attributes["llm.output_messages"]).toBe('[{"role":"assistant","content":"hello\\nworld"}]')
+    expect(recordSpanContext(logger.records.at(-1)!)).toEqual(llm.spanContext())
   })
 
   test("counts a message once across multiple steps", () => {
@@ -86,6 +87,7 @@ describe("handleStepFailed", () => {
     expect(llm.attributes["llm.cost.total"]).toBe(0.1)
     expect(logger.records.at(-1)!.body).toBe("api_error")
     expect(logger.records.at(-1)!.attributes?.["error"]).toBe("ProviderError: boom")
+    expect(recordSpanContext(logger.records.at(-1)!)).toEqual(llm.spanContext())
     expect(counters.message.calls).toHaveLength(1)
     expect(counters.modelUsage.calls).toHaveLength(1)
   })

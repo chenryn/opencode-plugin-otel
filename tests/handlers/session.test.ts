@@ -12,7 +12,7 @@ import {
   handleRetryScheduled,
   handleUsageUpdated,
 } from "../../src/handlers/session.ts"
-import { makeCtx, evt, tokens } from "../helpers.ts"
+import { makeCtx, evt, recordSpanContext, tokens } from "../helpers.ts"
 
 describe("handleSessionCreated", () => {
   test("increments the session counter and stores totals", () => {
@@ -34,6 +34,16 @@ describe("handleSessionCreated", () => {
     expect(ctx.tracing.sessionTotals.get("sub_1")!.parentID).toBe("ses_1")
     expect(logger.records[0]!.attributes?.["agent.name"]).toBe("explore")
     expect(logger.records.some((record) => record.body === "subtask_invoked")).toBe(true)
+  })
+
+  test("correlates subagent log events with the parent run", () => {
+    const { ctx, logger, tracer } = makeCtx()
+    handleSessionCreated(evt("session.created", { sessionID: "ses_1", projectID: "p" }), ctx)
+    handleExecutionStarted(evt("session.execution.started", { sessionID: "ses_1" }), ctx)
+    handleSessionCreated(evt("session.created", { sessionID: "sub_1", parentID: "ses_1", agent: "explore" }), ctx)
+    const parentRun = tracer.spans.find((span) => span.name === "opencode.session")!
+    const created = logger.records.find((record) => record.body === "session.created" && record.attributes?.["session.id"] === "sub_1")!
+    expect(recordSpanContext(created)).toEqual(parentRun.spanContext())
   })
 })
 
@@ -195,6 +205,18 @@ describe("handleExecutionEnded", () => {
     expect(tracer.spans[0]!.status.code).toBe(SpanStatusCode.ERROR)
     expect(logger.records.at(-1)!.body).toBe("session.error")
     expect(logger.records.at(-1)!.attributes?.["error"]).toBe("ProviderError: boom")
+    expect(recordSpanContext(logger.records.at(-1)!)).toEqual(tracer.spans[0]!.spanContext())
+  })
+
+  test("keeps the run span context until the session finalizes so idle logs correlate", () => {
+    const { ctx, logger, tracer } = makeCtx()
+    handleSessionCreated(evt("session.created", { sessionID: "ses_1" }, 100), ctx)
+    handleExecutionStarted(evt("session.execution.started", { sessionID: "ses_1" }), ctx)
+    handleExecutionEnded(evt("session.execution.succeeded", { sessionID: "ses_1" }), ctx, { type: "succeeded" })
+    finalizeSession("ses_1", ctx)
+    const idle = logger.records.find((record) => record.body === "session.idle")!
+    expect(recordSpanContext(idle)).toEqual(tracer.spans[0]!.spanContext())
+    expect(ctx.tracing.runSpanContexts.has("ses_1")).toBe(false)
   })
 })
 

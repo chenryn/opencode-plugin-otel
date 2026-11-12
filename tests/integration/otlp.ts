@@ -24,6 +24,11 @@ export function signalRecords(payloads: Payload[], signal: "Spans" | "Metrics" |
     .flatMap(resource => objects(resource[`scope${signal}`]).flatMap(scope => objects(scope[records]))))
 }
 
+export function instrumentationScopes(payloads: Payload[], signal: "Spans" | "Metrics" | "Logs"): Payload[] {
+  return payloads.flatMap(payload => objects(payload[`resource${signal}`])
+    .flatMap(resource => objects(resource[`scope${signal}`]).map(scope => scope["scope"] as Payload)))
+}
+
 export function metricPoints(metrics: Payload[], name: string, kind: "sum" | "histogram"): Payload[] {
   return metrics.filter(metric => metric["name"] === name)
     .flatMap(metric => objects((metric[kind] as Payload | undefined)?.["dataPoints"]))

@@ -1,5 +1,6 @@
 import type { HandlerContext, Instruments, TracingState, OpenCodeEvent } from "../src/types.ts"
 import { isEventSuppressed, type SemconvFlavor } from "../src/semconv.ts"
+import { eventContext } from "../src/util.ts"
 import type { LogRecord } from "@opentelemetry/api-logs"
 import type { Counter, Histogram, Span, SpanOptions, Tracer, Context, SpanContext, SpanStatus, Attributes } from "@opentelemetry/api"
 import { ROOT_CONTEXT, SpanStatusCode, trace } from "@opentelemetry/api"
@@ -248,10 +249,11 @@ export function makeCtx(
 
   const ctx: HandlerContext = {
     log: pluginLog.fn,
-    emitEvent: (record) => {
+    emitEvent: (record, spanContext) => {
       if (!logsEnabled) return
       if (isEventSuppressed(semconv, String(record.body))) return
-      logger.emit(record)
+      const context = eventContext(spanContext)
+      logger.emit(context ? { ...record, context } : record)
     },
     instruments,
     commonAttrs: { "project.id": projectID, ...extraCommonAttrs },
@@ -287,6 +289,11 @@ export function makeCtx(
 /** Returns a minimal well-formed V2 token usage sample. */
 export function tokens(input = 10, output = 5, reasoning = 0, cacheRead = 0, cacheWrite = 0) {
   return { input, output, reasoning, cache: { read: cacheRead, write: cacheWrite } }
+}
+
+/** Returns the span context stamped on an emitted log record, if any. */
+export function recordSpanContext(record: LogRecord): SpanContext | undefined {
+  return record.context ? trace.getSpanContext(record.context) : undefined
 }
 
 export type { Span }

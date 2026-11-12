@@ -185,6 +185,7 @@ export function handleStepEnded(e: EventOf<"session.step.ended">, ctx: HandlerCo
   accumulateTotals(d.sessionID, allTokens(d.tokens), d.cost, firstStep, ctx)
 
   const span = ctx.tracing.stepSpans.get(d.assistantMessageID)
+  const spanContext = ctx.tracing.stepSpanContexts.get(d.assistantMessageID)
   if (span) {
     const output = ctx.captureContent ? outputText(d.assistantMessageID, ctx) : undefined
     span.setAttributes(llmEndAttrs(ctx.semconv, {
@@ -230,7 +231,7 @@ export function handleStepEnded(e: EventOf<"session.step.ended">, ctx: HandlerCo
         : {}),
       ...ctx.commonAttrs,
     },
-  })
+  }, spanContext)
 }
 
 /** Records token/cost metrics for a failed step and emits an `api_error` log. */
@@ -252,6 +253,7 @@ export function handleStepFailed(e: EventOf<"session.step.failed">, ctx: Handler
   accumulateTotals(d.sessionID, allTokens(d.tokens), d.cost ?? 0, firstStep, ctx)
 
   const span = ctx.tracing.stepSpans.get(d.assistantMessageID)
+  const spanContext = ctx.tracing.stepSpanContexts.get(d.assistantMessageID)
   if (span) {
     const output = ctx.captureContent ? outputText(d.assistantMessageID, ctx) : undefined
     span.setAttributes(llmFailAttrs(ctx.semconv, {
@@ -292,7 +294,7 @@ export function handleStepFailed(e: EventOf<"session.step.failed">, ctx: Handler
         : {}),
       ...ctx.commonAttrs,
     },
-  })
+  }, spanContext)
 }
 
 function recordUsageMetrics(

@@ -9,6 +9,7 @@ import {
   markSeen,
   modelRef,
   resolveSubagentTraceContext,
+  sessionSpanContext,
   setBoundedMap,
   totalTokens,
 } from "../util.ts"
@@ -48,7 +49,7 @@ export function handlePromptEnqueued(e: EventOf<"session.inbox.enqueued">, ctx: 
       delivery: item.delivery,
       ...ctx.commonAttrs,
     },
-  })
+  }, sessionSpanContext(sessionID, ctx))
 }
 
 function countSession(sessionID: string, isSubagent: boolean, ctx: HandlerContext) {
@@ -121,7 +122,7 @@ export function handleSessionCreated(e: EventOf<"session.created">, ctx: Handler
         "parent.session.id": d.parentID,
         ...ctx.commonAttrs,
       },
-    })
+    }, sessionSpanContext(d.sessionID, ctx))
   }
 
   setBoundedMap(ctx.tracing.sessionTotals, d.sessionID, {
@@ -147,7 +148,7 @@ export function handleSessionCreated(e: EventOf<"session.created">, ctx: Handler
       ...(d.model ? { model: modelRef(d.model) } : {}),
       ...ctx.commonAttrs,
     },
-  })
+  }, sessionSpanContext(d.sessionID, ctx))
   void ctx.log("info", "otel: session.created", { sessionID: d.sessionID, isSubagent })
 }
 
@@ -244,7 +245,6 @@ export function handleExecutionEnded(
     }
     span.end(e.created)
     ctx.tracing.runSpans.delete(sessionID)
-    ctx.tracing.runSpanContexts.delete(sessionID)
   }
 
   if (outcome.type === "failed") {
@@ -265,7 +265,7 @@ export function handleExecutionEnded(
         error: message,
         ...ctx.commonAttrs,
       },
-    })
+    }, sessionSpanContext(sessionID, ctx))
     void ctx.log("error", "otel: session.error", { sessionID, error: message })
   }
 }
@@ -313,8 +313,10 @@ export function handleUsageUpdated(e: EventOf<"session.usage.updated">, ctx: Han
  * idle event does not double count.
  */
 export function finalizeSession(sessionID: string, ctx: HandlerContext) {
+  const spanContext = sessionSpanContext(sessionID, ctx)
   const totals = ctx.tracing.sessionTotals.get(sessionID)
   if (!totals) {
+    ctx.tracing.runSpanContexts.delete(sessionID)
     sweepExecution(sessionID, ctx)
     return
   }
@@ -330,6 +332,7 @@ export function finalizeSession(sessionID: string, ctx: HandlerContext) {
     })
   }
   ctx.tracing.sessionTotals.delete(sessionID)
+  ctx.tracing.runSpanContexts.delete(sessionID)
   ctx.tracing.activeLlm.delete(sessionID)
   ctx.tracing.activeStepSpans.delete(sessionID)
   ctx.tracing.modelContexts.delete(sessionID)
@@ -362,7 +365,7 @@ export function finalizeSession(sessionID: string, ctx: HandlerContext) {
       total_messages: totals.messages,
       ...ctx.commonAttrs,
     },
-  })
+  }, spanContext)
   void ctx.log("debug", "otel: session.idle", {
     sessionID,
     duration_ms: durationMs,

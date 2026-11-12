@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, test } from "bun:test"
 import { runScenario } from "./fixtures.ts"
-import { attributes, metricPoints, objects, signalRecords } from "./otlp.ts"
+import { attributes, instrumentationScopes, metricPoints, objects, signalRecords } from "./otlp.ts"
 
 test("exports real OpenCode session telemetry over OTLP/JSON", async () => {
   const { received, requests, result } = await runScenario("text")
@@ -26,6 +26,21 @@ test("exports real OpenCode session telemetry over OTLP/JSON", async () => {
   const logs = signalRecords(received["logs"]!, "Logs")
   expect(logs.some(log => attributes(log)["event.name"] === "api_request")).toBe(true)
   expect(logs.some(log => attributes(log)["event.name"] === "session.idle")).toBe(true)
+
+  const request = logs.find(log => attributes(log)["event.name"] === "api_request")!
+  expect(request["traceId"]).toBe(llm["traceId"])
+  expect(request["spanId"]).toBe(llm["spanId"])
+
+  const idle = logs.find(log => attributes(log)["event.name"] === "session.idle")!
+  expect(idle["traceId"]).toBe(run["traceId"])
+  expect(idle["spanId"]).toBe(run["spanId"])
+
+  for (const signal of ["traces", "metrics", "logs"] as const) {
+    for (const scope of instrumentationScopes(received[signal]!, signal === "traces" ? "Spans" : signal === "metrics" ? "Metrics" : "Logs")) {
+      expect(scope["name"]).toBe("com.opencode")
+      expect(scope["version"]).toBeString()
+    }
+  }
 }, 40_000)
 
 for (const disabled of [false, true]) {

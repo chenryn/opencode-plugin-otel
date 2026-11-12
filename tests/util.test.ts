@@ -1,6 +1,8 @@
 import { describe, test, expect } from "bun:test"
+import { trace } from "@opentelemetry/api"
 import { MAX_PENDING } from "../src/types.ts"
-import { errorSummary, genAiProviderName, markSeen, modelRef, setBoundedMap, totalTokens } from "../src/util.ts"
+import { eventContext, errorSummary, genAiProviderName, markSeen, modelRef, setBoundedMap, sessionSpanContext, totalTokens } from "../src/util.ts"
+import { makeCtx } from "./helpers.ts"
 
 describe("errorSummary", () => {
   test("formats structured errors", () => {
@@ -48,5 +50,35 @@ describe("markSeen", () => {
     markSeen(seen, "b")
     expect(seen.has("a")).toBe(true)
     expect(seen.size).toBe(2)
+  })
+})
+
+const SPAN_CONTEXT = {
+  traceId: "0af7651916cd43dd8448eb211c80319c",
+  spanId: "b7ad6b7169203331",
+  traceFlags: 1,
+}
+
+describe("eventContext", () => {
+  test("stamps a valid span context onto the log-record context", () => {
+    const context = eventContext(SPAN_CONTEXT)!
+    expect(trace.getSpanContext(context)).toEqual(SPAN_CONTEXT)
+  })
+
+  test("omits an absent or invalid span context", () => {
+    expect(eventContext(undefined)).toBeUndefined()
+    expect(eventContext({ traceId: "0".repeat(32), spanId: "0".repeat(16), traceFlags: 0 })).toBeUndefined()
+  })
+})
+
+describe("sessionSpanContext", () => {
+  test("prefers the session's own run and falls back to the parent run", () => {
+    const { ctx } = makeCtx()
+    ctx.tracing.runSpanContexts.set("ses_1", SPAN_CONTEXT)
+    expect(sessionSpanContext("ses_1", ctx)).toEqual(SPAN_CONTEXT)
+
+    ctx.tracing.sessionIdentity.set("sub_1", { agent: "explore", agentType: "subagent", parentID: "ses_1", startMs: 1 })
+    expect(sessionSpanContext("sub_1", ctx)).toEqual(SPAN_CONTEXT)
+    expect(sessionSpanContext("unknown", ctx)).toBeUndefined()
   })
 })

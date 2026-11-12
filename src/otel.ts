@@ -174,8 +174,8 @@ export async function setupOtel(
 }
 
 /** Creates all metric instruments using the global `MeterProvider`. Metric names are prefixed with `prefix`. */
-export function createInstruments(prefix: string): Instruments {
-  const meter = metrics.getMeter("com.opencode")
+export function createInstruments(prefix: string, version?: string): Instruments {
+  const meter = metrics.getMeter("com.opencode", version)
   return {
     sessionCounter: meter.createCounter(`${prefix}session.count`, {
       unit: "{session}",

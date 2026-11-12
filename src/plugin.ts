@@ -7,7 +7,7 @@ import { forceFlushOtel } from "./otel.ts"
 import { remoteParentContext } from "./trace-context.ts"
 import { acquireSharedOtel, acquireTracingState, createFlushScheduler, flushSharedOtel, releaseSharedOtel } from "./state.ts"
 import { LEVELS, type HandlerContext, type Level, type OpenCodeContext, type OpenCodeEvent } from "./types.ts"
-import { consumeEvents, contextForSession, setBoundedMap } from "./util.ts"
+import { consumeEvents, contextForSession, eventContext, setBoundedMap } from "./util.ts"
 import {
   finalizeSession,
   handleExecutionEnded,
@@ -95,10 +95,11 @@ export async function setup(ctx: OpenCodeContext): Promise<() => Promise<void>> 
     })
   }
 
-  const emitEvent: HandlerContext["emitEvent"] = (record) => {
+  const emitEvent: HandlerContext["emitEvent"] = (record, spanContext) => {
     if (!config.logsEnabled) return
     if (isEventSuppressed(config.semconv, String(record.body))) return
-    shared.logger.emit(record)
+    const context = eventContext(spanContext)
+    shared.logger.emit(context ? { ...record, context } : record)
   }
 
   const remoteContext = remoteParentContext(config.traceparent, config.tracestate)

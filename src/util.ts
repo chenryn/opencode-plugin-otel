@@ -1,4 +1,4 @@
-import { trace, type Context } from "@opentelemetry/api"
+import { isSpanContextValid, ROOT_CONTEXT, trace, type Context, type SpanContext } from "@opentelemetry/api"
 import { MAX_PENDING, type HandlerContext, type SessionAgentType, type TracingState } from "./types.ts"
 
 const MAX_SEEN_EVENTS = 10_000
@@ -163,6 +163,27 @@ export function resolveSubagentTraceContext(sessionID: string, parentID: string,
     return trace.setSpan(ctx.rootContext(), span)
   }
   return resolveRunContext(parentID, ctx)
+}
+
+/**
+ * Builds the log-record context that correlates an emitted event with `spanContext`.
+ * The OTel logs SDK stamps `traceId`/`spanId` from the record context (falling back to
+ * `context.active()`, which is the root context here because handlers never activate
+ * their spans), so events must carry the context explicitly.
+ */
+export function eventContext(spanContext: SpanContext | undefined): Context | undefined {
+  return spanContext && isSpanContextValid(spanContext) ? trace.setSpanContext(ROOT_CONTEXT, spanContext) : undefined
+}
+
+/**
+ * Resolves the span context log events for `sessionID` should correlate with: the
+ * session's own run, or the parent run for a subagent session that has not started.
+ */
+export function sessionSpanContext(sessionID: string, ctx: HandlerContext): SpanContext | undefined {
+  const own = ctx.tracing.runSpanContexts.get(sessionID)
+  if (own) return own
+  const parentID = ctx.tracing.sessionIdentity.get(sessionID)?.parentID
+  return parentID ? ctx.tracing.runSpanContexts.get(parentID) : undefined
 }
 
 /** Resolves the current session-scoped agent name/type, defaulting to `unknown` when unavailable. */

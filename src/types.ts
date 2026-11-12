@@ -192,7 +192,7 @@ export type TracingState = {
 export type HandlerContext = {
   log: PluginLogger
   /** Emits a log event; redundant events are dropped in the `gen_ai` flavor. */
-  emitEvent: (record: LogRecord) => void
+  emitEvent: (record: LogRecord, spanContext?: SpanContext) => void
   instruments: Instruments
   commonAttrs: CommonAttrs
   disabledMetrics: Set<string>
