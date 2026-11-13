@@ -63,7 +63,10 @@ per-step LLM spans; completed text segments still populate `output.value` and
 
 When V2 provides an unambiguous child session ID through subagent tool progress or result metadata,
 subagent run spans nest under the dispatch tool span. Ambiguous or missed correlations fall back to
-the parent run span; a background child may outlive its already-ended dispatch tool span.
+the parent run span; a background child may outlive its already-ended dispatch tool span. The
+correlation is also written to attributes: a subagent run span carries `parent_session_id` and,
+when the dispatch is known, `parent_tool_call_id`; the dispatch tool span declares the same
+`parent_tool_call_id` (its own call id) so both sides join on one key.
 
 ## What it instruments
 
@@ -82,17 +85,27 @@ the parent run span; a background child may outlive its already-ended dispatch t
 | `opencode.session.token.total` | Histogram | Total tokens consumed per session, recorded when an execution ends |
 | `opencode.session.cost.total` | Histogram | Total cost per session in USD, recorded when an execution ends |
 | `opencode.model.usage` | Counter | Messages per model and provider |
-| `opencode.retry.count` | Counter | API retries observed via durable `session.retry.scheduled` events |
+| `opencode.retry.count` | Counter | API retries observed via durable `session.retry.scheduled` events (attributes: `retry.attempt`, `error.type`; not added to normal calls) |
 | `opencode.subtask.count` | Counter | Sub-agent sessions observed via `session.created` with a `parentID` |
+| `opencode.exporter.export.failures` | Counter | Failed OTLP export batches, by `signal` (`traces`/`metrics`/`logs`) and `error.type` (`auth`/`unavailable`/`timeout`/`other`). Counted per batch, never per span, and only on failure so an outage cannot amplify the metric stream |
+| `opencode.exporter.auth.retry.count` | Counter | Header refreshes triggered by an authentication failure, by `signal` |
+| `opencode.event.dispatch.errors` | Counter | Event-dispatch failures, by `event.type` |
+| `opencode.flush.failures` | Counter | Scheduled flushes where at least one provider failed |
+| `opencode.flush.duration` | Histogram | Duration of a scheduled flush in milliseconds |
 
-Under [`OPENCODE_SEMCONV=gen_ai`](#semantic-conventions-opencode_semconv) the two token/latency metrics are
+Under [`OPENCODE_SEMCONV=gen_ai`](#semantic-conventions-opencode_semconv) the inference and tool metrics are
 replaced by their official GenAI counterparts, which are **never prefixed** and therefore unaffected by
-`OPENCODE_METRIC_PREFIX`. `opencode.token.usage` is not emitted at all in that mode.
+`OPENCODE_METRIC_PREFIX`. `opencode.token.usage` and `opencode.tool.duration` are not emitted at all in that mode.
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `gen_ai.client.token.usage` | Histogram | Tokens per request, split by `gen_ai.token.type` = `input` (prompt + cache read + cache write) or `output` (completion + reasoning) |
-| `gen_ai.client.operation.duration` | Histogram | LLM request duration in seconds, with `error.type` on failure |
+| `gen_ai.client.inference.duration` | Histogram | LLM request duration in seconds, with `error.type` on failure |
+| `gen_ai.client.inference.usage.input_tokens` | Counter | Input tokens, including cache reads and writes; `gen_ai.token.modality=unknown` because the provider reports one aggregate count |
+| `gen_ai.client.inference.usage.output_tokens` | Counter | Output tokens, including reasoning; `gen_ai.token.modality=text` |
+| `gen_ai.client.inference.usage.cache_read.input_tokens` | Counter | Cache-read input tokens, a subset of the input counter |
+| `gen_ai.client.inference.usage.cache_write.input_tokens` | Counter | Cache-write input tokens, a subset of the input counter |
+| `gen_ai.client.inference.usage.reasoning.output_tokens` | Counter | Reasoning output tokens, a subset of the output counter |
+| `gen_ai.execute_tool.duration` | Histogram | Tool execution time in seconds, with `error.type` on failure |
 | `gen_ai.server.time_to_first_token` | Histogram | Time to first streamed token in seconds (emitted in both dialects) |
 
 ### Traces
@@ -116,16 +129,37 @@ conventions instead, including the operation-qualified span names (`invoke_agent
 | `api_request` | Completed LLM step (tokens, cost) |
 | `api_error` | Failed LLM step (error summary) |
 | `tool_result` | Tool completed or errored (duration, success, output size) |
-| `tool_decision` | Permission prompt answered (accept/reject) |
+| `permission.requested` | Permission prompt asked (`permission.action`, `permission.resources`, `request.id`, `target.tool_call.id`, `target.span.id`) |
+| `tool_decision` | Permission prompt answered (accept/reject); carries the same `request.id` and target correlation plus `permission.action` only — it never records a policy verdict |
 | `commit` | Git commit detected |
 | `subtask_invoked` | Sub-agent session created (agent and parent session ID) |
 
 Under [`OPENCODE_SEMCONV=gen_ai`](#semantic-conventions-opencode_semconv), `session.created`, `api_request`,
-`api_error`, and `tool_result` are **not emitted**: each duplicates a span (`invoke_agent`, `chat`,
-`execute_tool`) that already carries the same information, so a backend counting both signals would
-double count. The remaining events keep their `event.name` schema but swap their identity attributes for
-GenAI keys (`gen_ai.conversation.id`, `gen_ai.agent.name`, `gen_ai.request.model`, `gen_ai.provider.name`,
-`gen_ai.tool.name`); `session.id` is kept in both dialects as the cross-signal join key.
+`api_error`, and `tool_result` duplicate a span (`invoke_agent`, `chat`, `execute_tool`) that already carries
+the same information. They are **emitted by default** so an audit timeline keeps every lifecycle marker;
+set `OPENCODE_EMIT_REDUNDANT_EVENTS=0` to suppress them when a backend counts spans and events together and
+would otherwise double count. The remaining events keep their `event.name` schema but swap their identity
+attributes for GenAI keys (`gen_ai.conversation.id`, `gen_ai.agent.name`, `gen_ai.request.model`,
+`gen_ai.provider.name`, `gen_ai.tool.name`); `session.id` is kept in both dialects as the cross-signal join key.
+
+Every failure event (`api_error`, `session.error`, `tool_result` with `success=false`, and a rejected
+`tool_decision`) carries the structured error verbatim: `error.type` is the grouping key, `error.message`
+and `error.status` keep the details that a flattened `"type: message"` string would lose. A rejected
+permission records `permission.decision=reject` with `error.type=permission_denied`; it reports the fact
+only and never enforces policy.
+
+Tool spans and `tool_result` events also carry the fact layer, which is metadata rather than content:
+`tool.command` (verbatim command of shell tools) and `file.operation` / `file.path` / `file.paths`
+(`read`, `write`, `edit`, `list`, `glob`, `search`). Facts are emitted even when content capture is off,
+because they are what audits search on; set `OPENCODE_CAPTURE_TOOL_FACTS=0` to suppress them when raw
+commands must not leave the host. The plugin never writes a judgement field (`risk.*`, `policy.*`,
+`audit.*`) — detection and enforcement belong to an external rule engine.
+
+Every content-bearing attribute is capped at 20,000 characters. A truncated value always carries
+`<field>.truncated=true` and `<field>.original_length`, where `<field>` is `tool.arguments`,
+`tool.result`, `content.output`, `content.input`, `prompt`, or `tool.command`; counters such as `prompt_length`
+and `tool.result_size_bytes` always report the original size. A multi-path list that is cut also reports
+`file.paths.truncated` and `file.paths.original_count`.
 
 ## Installation
 
@@ -173,6 +207,7 @@ The environment variables (set them in your shell profile — `~/.zshrc`, `~/.ba
 | `OPENCODE_DISABLE_METRICS` | *(unset)* | Comma-separated list of metric name suffixes to disable (e.g. `cache.count,session.duration`) |
 | `OPENCODE_DISABLE_LOGS` | *(unset)* | Set to any non-empty value to suppress all OTLP log events while leaving metrics and traces unchanged |
 | `OPENCODE_CAPTURE_PROMPT_IN_LOGS` | *(unset)* | Set to any non-empty value to include the full prompt text in the `prompt` attribute of `user_prompt` log events. **Log events only** — trace spans carry an observed prompt in `input.value` regardless of this flag (disable span-level capture separately via `OPENCODE_DISABLE_TRACES`). **Off by default — prompts may contain secrets or PII; enable only for trusted collectors.** |
+| `OPENCODE_CAPTURE_TOOL_FACTS` | enabled | Emit the factual tool layer (`tool.command`, `file.operation`, `file.path`, `file.paths`) on tool spans and `tool_result` events. Set to `0`, `false`, `no`, or `off` to suppress it; independent of `OPENCODE_CAPTURE_MODEL_CONTEXT`. Commands are recorded verbatim and may contain secrets. |
 | `OPENCODE_CAPTURE_MODEL_CONTEXT` | *(unset)* | Set to any non-empty value to attach a bounded text-only preview of the primary model-visible context to LLM spans. Off by default; can include system instructions, earlier messages, and tool text. Under `OPENCODE_SEMCONV=gen_ai` this flag also gates every content-bearing GenAI attribute (`gen_ai.input.messages`, `gen_ai.output.messages`, `gen_ai.tool.call.arguments`, `gen_ai.tool.call.result`) and the `prompt` log attribute, because those are Opt-In in the GenAI conventions. |
 | `OPENCODE_DISABLE_TRACES` | *(unset)* | Comma-separated list of trace types to disable (`session`, `llm`, `tool`). Use `all`, `*`, `true`, or `1` to disable every trace type |
 | `OPENCODE_OTLP_HEADERS` | *(unset)* | Comma-separated `key=value` headers added to all OTLP exports. **Keep out of version control — may contain sensitive auth tokens.** |
@@ -183,7 +218,8 @@ The environment variables (set them in your shell profile — `~/.zshrc`, `~/.ba
 | `OPENCODE_TRACEPARENT` | *(unset)* | W3C [`traceparent`](https://www.w3.org/TR/trace-context/#traceparent-header) string. When set, all spans are parented under this remote context so opencode traces nest inside a caller's trace (e.g. a CI job). Invalid values are logged and ignored. Note: with the default `ParentBased` sampler, a value with the sampled flag off (`...-00`) suppresses all trace export. |
 | `OPENCODE_TRACESTATE` | *(unset)* | W3C [`tracestate`](https://www.w3.org/TR/trace-context/#tracestate-header) string, parsed alongside `OPENCODE_TRACEPARENT` and attached to the remote parent context. Ignored unless a valid `OPENCODE_TRACEPARENT` is also set. |
 | `OPENCODE_TRACE_PROPAGATION_PROVIDERS` | *(unset)* | Comma-separated opencode provider IDs that receive W3C `traceparent` and `tracestate` headers on LLM requests. Use `*` to explicitly enable every provider. |
-| `OPENCODE_SEMCONV` | `openinference` | Wire dialect: `openinference` (OpenInference conventions) or `gen_ai` (OpenTelemetry GenAI conventions). Switches span attributes, metric names, and log-event attributes together, and suppresses log events that duplicate a span. See [Semantic conventions](#semantic-conventions-opencode_semconv). |
+| `OPENCODE_SEMCONV` | `openinference` | Wire dialect: `openinference` (OpenInference conventions) or `gen_ai` (OpenTelemetry GenAI conventions). Switches span attributes, metric names, and log-event attributes together. See [Semantic conventions](#semantic-conventions-opencode_semconv). |
+| `OPENCODE_EMIT_REDUNDANT_EVENTS` | enabled | Set to `0`, `false`, `no`, or `off` to suppress the `gen_ai` log events that duplicate a span (`session.created`, `api_request`, `api_error`, `tool_result`). Leave enabled when spans and events feed the same dashboards and you need a complete audit timeline; disable to avoid double counting. |
 
 Prompt logging remains disabled by default. Enable it only when the configured telemetry destination is trusted to receive potentially sensitive prompt contents.
 
@@ -217,7 +253,9 @@ Option keys mirror the resolved config and map to the environment variables:
 | `enabled` | `OPENCODE_ENABLE_TELEMETRY` |
 | `logsEnabled` | `OPENCODE_DISABLE_LOGS` (inverted) |
 | `capturePromptInLogs` | `OPENCODE_CAPTURE_PROMPT_IN_LOGS` |
+| `captureToolFacts` | `OPENCODE_CAPTURE_TOOL_FACTS` |
 | `captureModelContext` | `OPENCODE_CAPTURE_MODEL_CONTEXT` |
+| `emitRedundantEvents` | `OPENCODE_EMIT_REDUNDANT_EVENTS` (inverted: `false` suppresses) |
 | `logLevel` | *(none — option only)*: `debug`, `info`, `warn`, `error` |
 | `endpoint` | `OPENCODE_OTLP_ENDPOINT` |
 | `protocol` | `OPENCODE_OTLP_PROTOCOL` |
@@ -270,6 +308,28 @@ export OPENCODE_SPAN_ATTRIBUTES="team=platform,deployment.environment=production
 
 - Use `OPENCODE_RESOURCE_ATTRIBUTES` for producer metadata on the OTel Resource.
 - Use `OPENCODE_SPAN_ATTRIBUTES` for attributes that need to appear on each span, log event, and metric data point for filtering or grouping in backends.
+
+### Host and deployment identity
+
+Set host and deployment dimensions on the **resource**, not on individual spans:
+
+```bash
+export OPENCODE_RESOURCE_ATTRIBUTES="host.name=build-07,service.instance.id=opencode-3f2a,deployment.environment.name=production,service.namespace=platform"
+```
+
+| Dimension | Recommended key | Notes |
+|-----------|-----------------|-------|
+| Host | `host.name` | Written explicitly by the deployer. The plugin does not guess it: inside containers the OS hostname is often meaningless or duplicated. |
+| Instance | `service.instance.id` | Unique per process, so several opencode instances on one host stay distinguishable. |
+| Environment | `deployment.environment.name` | Current semantic-convention name. Older backends still accept `deployment.environment`. |
+| Namespace | `service.namespace` | Team or tenant deployment dimension. |
+
+Two rules to keep identity honest:
+
+- `project.id` is a **workspace** dimension the plugin derives from the observed session. It is not a user identity — do not alias it to `user.id` or `tenant.id`.
+- This plugin never infers user identity. Map source IPs to users in the Collector (for example a `resource` processor) and inject `user.id` there.
+
+Because `resourceAttributes` participates in the process-wide configuration fingerprint, every plugin instance in one process must use the same resource attributes; a conflict fails setup instead of exporting one location's data with another location's identity.
 
 ### Dynamic headers
 
@@ -354,19 +414,28 @@ export OPENCODE_SEMCONV=gen_ai
 | Output | `output.value`, `output.mime_type`, `llm.output_messages` | `gen_ai.output.messages` |
 | Token usage | `llm.token_count.prompt` / `.completion` / `.total`, `llm.token_count.prompt_details.cache_read` / `.cache_write` | `gen_ai.usage.input_tokens` (prompt + cache read + cache write), `gen_ai.usage.output_tokens` (completion + reasoning), `gen_ai.usage.cache_read.input_tokens`, `gen_ai.usage.cache_creation.input_tokens` |
 | Finish reason | `llm.finish_reason` (string) | `gen_ai.response.finish_reasons` (array) |
-| Failure | span status + `llm.finish_reason` | span status + `error.type` |
+| Failure | span status + `llm.finish_reason` + `error.type` / `error.message` / `error.status` | span status + `error.type` / `error.message` / `error.status` |
+| Cost | `llm.cost.total`, `cost_usd` | `gen_ai.usage.cost`, `session.total_cost_usd` |
+| Turn / step | — | `gen_ai.turn.id`, `gen_ai.step.id` (extensions) |
 | Tool call | `tool.id`, `tool.name`, `tool.parameters` | `gen_ai.tool.call.id`, `gen_ai.tool.name`, `gen_ai.tool.type`, `gen_ai.tool.call.arguments`, `gen_ai.tool.call.result` |
 | Time to first token | `gen_ai.server.time_to_first_token` (s) and `llm.time_to_first_token_ms` | `gen_ai.server.time_to_first_token` (s) |
-| Token metric | `{prefix}token.usage` counter, `type=input` / `output` / `reasoning` / `cacheRead` / `cacheCreation` | `gen_ai.client.token.usage` histogram, `gen_ai.token.type` = `input` / `output` |
-| Latency metric | `{prefix}tool.duration` only | adds `gen_ai.client.operation.duration` (s) for every LLM request |
-| Log events | all ten events | drops `session.created`, `api_request`, `api_error`, `tool_result` (redundant with spans) |
+| Token metric | `{prefix}token.usage` counter, `type=input` / `output` / `reasoning` / `cacheRead` / `cacheCreation` | five `gen_ai.client.inference.usage.*` counters, split by token category and tagged `gen_ai.token.modality` |
+| Latency metric | `{prefix}tool.duration` only | adds `gen_ai.client.inference.duration` (s) per LLM request and `gen_ai.execute_tool.duration` (s) per tool call |
+| Log events | all ten events | all ten events; set `OPENCODE_EMIT_REDUNDANT_EVENTS=0` to drop `session.created`, `api_request`, `api_error`, `tool_result` |
 | Log/metric identity | `session.id`, `model`, `provider`, `agent`, `tool_name` | `gen_ai.conversation.id`, `gen_ai.request.model`, `gen_ai.provider.name`, `gen_ai.agent.name`, `gen_ai.tool.name` (plus `session.id`) |
 
 Notes:
 
+- **The GenAI metric names track the current `semantic-conventions-genai` revision, not the 1.40 release.** That revision replaced the `gen_ai.client.token.usage` histogram and `gen_ai.client.operation.duration` with one monotonic counter per token category (`gen_ai.client.inference.usage.*`) plus `gen_ai.client.inference.duration`, and added `gen_ai.execute_tool.duration`. A backend dashboard written against the 1.40 names needs a rename or a collector transform.
+- **Token counters carry `gen_ai.token.modality`.** Generated tokens are `text`; prompt, cache-read, and cache-write tokens are `unknown`, because opencode receives a single aggregate prompt count and the text/image/audio split cannot be recovered. The conventions require `unknown` rather than a guess when the split is unavailable, so per-modality ratios are only meaningful once a provider reports them.
+
 - **The whole signal set switches together.** Spans, metric names, and log-event attributes all follow `OPENCODE_SEMCONV`, so a GenAI-native backend needs no translation layer. `OPENCODE_METRIC_PREFIX` does not apply to the `gen_ai.*` metrics, because a prefixed name would no longer match the convention.
+- **Turn and step correlation.** Every run span carries `gen_ai.turn.id` (`<sessionID>:<sequence>`, strictly increasing per session) and every LLM/tool span carries the same turn id plus `gen_ai.step.id` (the assistant message id of the owning step). Backends that merge sessions therefore never see a colliding turn number, and a tool call can be joined back to its step and turn without a span tree. These two keys are plugin extensions with no official constant; the `openinference` flavor omits them.
+- **Cost.** The `gen_ai` flavor reports per-request cost as the extension key `gen_ai.usage.cost` and session totals as `session.total_cost_usd`; the `openinference` flavor keeps `llm.cost.total` and `cost_usd`. Do not sum two of them for the same scope.
+- **Structured errors.** `error.type` is taken from the structured error payload (`{type, message, status}`) and only falls back to the finish reason when none was reported, so negative-sample rules can group on a stable type. `error.message` and `error.status` are preserved alongside it.
 - **Content attributes are Opt-In in the GenAI conventions**, so under `gen_ai` they follow `OPENCODE_CAPTURE_MODEL_CONTEXT` instead of always being on: `gen_ai.input.messages`, `gen_ai.output.messages`, `gen_ai.tool.call.arguments`, `gen_ai.tool.call.result`, and the `prompt` attribute of `user_prompt`. Everything else — span names, operation names, identity, usage, finish reasons — is emitted regardless.
-- **opencode-specific attributes are emitted in both dialects**, because the conventions do not model them: `agent.type`, `session.is_subagent`, `session.total_tokens`, `session.total_cost_usd`, `session.total_messages`, `cost_usd`, `duration_ms`, `tool.success`, `tool.error`, `tool.result_size_bytes`, `tool.provider_executed`, `subagent.agent`, plus anything from `OPENCODE_SPAN_ATTRIBUTES`.
+- **Retry and subtask correlation.** Each durable `session.retry.scheduled` event increments the retry counter (with `retry.attempt` and the structured `error.type`) and stamps the current run span with `session.retry.count`, `retry.attempt`, and the error fields; the per-execution count resets when the next execution starts, so retries never add to normal calls. Subagent runs carry `parent_session_id` plus `parent_tool_call_id` when the dispatch is correlated, which lets a backend split subtask volume by parent session while `subtask.count` still counts each child session once.
+- **opencode-specific attributes are emitted in both dialects**, because the conventions do not model them: `agent.type`, `session.is_subagent`, `parent_session_id`, `parent_tool_call_id`, `session.retry.count`, `retry.attempt`, `session.total_tokens`, `session.total_cost_usd`, `session.total_messages`, `duration_ms`, `tool.success`, `tool.error`, `tool.result_size_bytes`, `tool.provider_executed`, `error.type`, `error.message`, `error.status`, `subagent.agent`, plus anything from `OPENCODE_SPAN_ATTRIBUTES`.
 - **`gen_ai.usage.input_tokens` includes cache tokens**, matching how OpenAI reports `prompt_tokens`. Cache reads and writes are also broken out separately.
 - An unrecognized value is logged as a warning and ignored; the plugin falls back to `openinference`.
 - Only text parts are serialized into message attributes. Media and structured tool payloads are never copied into spans.
@@ -378,14 +447,14 @@ Use `OPENCODE_DISABLE_METRICS` to suppress individual metrics. The value is a co
 Disabling a metric only stops the counter/histogram from being incremented — the corresponding log events are still emitted.
 
 Under [`OPENCODE_SEMCONV=gen_ai`](#semantic-conventions-opencode_semconv) the GenAI metrics have no prefix, so list
-them by full name (`OPENCODE_DISABLE_METRICS="gen_ai.client.token.usage,gen_ai.client.operation.duration"`).
+them by full name (`OPENCODE_DISABLE_METRICS="gen_ai.client.inference.usage.input_tokens,gen_ai.client.inference.duration"`).
 
 ```bash
 # Disable a single metric
 export OPENCODE_DISABLE_METRICS="retry.count"
 
 # Disable multiple metrics
-export OPENCODE_DISABLE_METRICS="cache.count,session.duration,session.token.total,session.cost.total,model.usage,retry.count,message.count"
+export OPENCODE_DISABLE_METRICS="cache.count,session.duration,session.token.total,session.cost.total,model.usage,retry.count,message.count,exporter.export.failures,exporter.auth.retry.count,event.dispatch.errors,flush.failures,flush.duration"
 ```
 
 #### opencode-only metrics
@@ -393,7 +462,7 @@ export OPENCODE_DISABLE_METRICS="cache.count,session.duration,session.token.tota
 The following metrics are specific to opencode and have no equivalent in Claude Code's built-in monitoring. If you are using a Claude Code dashboard and want to avoid cluttering it with opencode-only metrics, you can disable them:
 
 ```bash
-export OPENCODE_DISABLE_METRICS="cache.count,session.duration,session.token.total,session.cost.total,model.usage,retry.count,message.count"
+export OPENCODE_DISABLE_METRICS="cache.count,session.duration,session.token.total,session.cost.total,model.usage,retry.count,message.count,exporter.export.failures,exporter.auth.retry.count,event.dispatch.errors,flush.failures,flush.duration"
 ```
 
 | Metric suffix | Why it's opencode-only |
@@ -405,6 +474,9 @@ export OPENCODE_DISABLE_METRICS="cache.count,session.duration,session.token.tota
 | `model.usage` | Per-model message counter — not emitted by Claude Code |
 | `retry.count` | API retry counter — not emitted by Claude Code |
 | `message.count` | Completed message counter — not emitted by Claude Code |
+| `exporter.*` | OTLP export health counters — plugin diagnostics |
+| `event.dispatch.errors` | Event dispatch failures — plugin diagnostics |
+| `flush.*` | Scheduled flush failures and duration — plugin diagnostics |
 
 ### Disabling OTLP logs
 

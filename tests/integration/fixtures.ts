@@ -9,6 +9,7 @@ export type ScenarioOptions = {
   disabledTraces?: string
   semconv?: "openinference" | "gen_ai"
   captureModelContext?: boolean
+  emitRedundantEvents?: boolean
 }
 
 export async function runScenario(scenario: "text" | "read", options: ScenarioOptions = {}) {
@@ -93,6 +94,7 @@ export async function runScenario(scenario: "text" | "read", options: ScenarioOp
       OPENCODE_DISABLE_TRACES: options.disabledTraces ?? "",
       OPENCODE_SEMCONV: options.semconv ?? "",
       ...(options.captureModelContext ? { OPENCODE_CAPTURE_MODEL_CONTEXT: "1" } : {}),
+      ...(options.emitRedundantEvents === false ? { OPENCODE_EMIT_REDUNDANT_EVENTS: "0" } : {}),
     })
     const git = Bun.spawnSync(["git", "init", "--quiet", directory], { env })
     if (git.exitCode !== 0) throw new Error(git.stderr.toString())

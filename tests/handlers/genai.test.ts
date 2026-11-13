@@ -7,7 +7,7 @@ import {
   handleSessionCreated,
 } from "../../src/handlers/session.ts"
 import { handleStepEnded, handleStepFailed, handleStepStarted, handleTextEnded, handleTextStarted } from "../../src/handlers/step.ts"
-import { handleToolCalled, handleToolInputStarted, handleToolSuccess } from "../../src/handlers/tool.ts"
+import { handleToolCalled, handleToolFailed, handleToolInputStarted, handleToolSuccess } from "../../src/handlers/tool.ts"
 import { makeCtx, evt, tokens } from "../helpers.ts"
 
 function genAiCtx() {
@@ -64,8 +64,12 @@ describe("gen_ai flavor end to end", () => {
     expect(llm.attributes["gen_ai.operation.name"]).toBe("chat")
     expect(llm.attributes["gen_ai.provider.name"]).toBe("anthropic")
     expect(llm.attributes["gen_ai.request.model"]).toBe("claude-sonnet")
+    expect(llm.attributes["gen_ai.turn.id"]).toBe("ses_1:1")
+    expect(llm.attributes["gen_ai.step.id"]).toBe("msg_1")
     expect(llm.attributes["gen_ai.usage.input_tokens"]).toBe(17)
     expect(llm.attributes["gen_ai.usage.output_tokens"]).toBe(7)
+    expect(llm.attributes["gen_ai.usage.cost"]).toBe(0.25)
+    expect(llm.attributes["cost_usd"]).toBeUndefined()
     expect(llm.attributes["gen_ai.response.finish_reasons"]).toEqual(["stop"])
     expect(llm.attributes["gen_ai.server.time_to_first_token"]).toBe(0.4)
     expect(llm.attributes["gen_ai.output.messages"]).toBe('[{"role":"assistant","parts":[{"type":"text","content":"hello"}],"finish_reason":"stop"}]')
@@ -74,7 +78,18 @@ describe("gen_ai flavor end to end", () => {
     const run = tracer.spans.find((span) => span.name === "invoke_agent build")!
     expect(run.attributes["gen_ai.operation.name"]).toBe("invoke_agent")
     expect(run.attributes["gen_ai.conversation.id"]).toBe("ses_1")
+    expect(run.attributes["gen_ai.turn.id"]).toBe("ses_1:1")
+    expect(run.attributes["gen_ai.usage.cost"]).toBe(0.25)
     expect(run.attributes["session.total_tokens"]).toBe(24)
+  })
+
+  test("increments the turn id for each execution inside a session", () => {
+    const { ctx, tracer } = genAiCtx()
+    seedRun(ctx)
+    handleExecutionEnded(evt("session.execution.succeeded", { sessionID: "ses_1" }, 2000), ctx, { type: "succeeded" })
+    handleExecutionStarted(evt("session.execution.started", { sessionID: "ses_1" }, 2100), ctx)
+    const runs = tracer.spans.filter((span) => span.name === "invoke_agent build")
+    expect(runs.map((span) => span.attributes["gen_ai.turn.id"])).toEqual(["ses_1:1", "ses_1:2"])
   })
 
   test("emits execute_tool spans carrying arguments and results", () => {
@@ -90,6 +105,8 @@ describe("gen_ai flavor end to end", () => {
     expect(tool.attributes["gen_ai.tool.name"]).toBe("read")
     expect(tool.attributes["gen_ai.tool.call.id"]).toBe("call_1")
     expect(tool.attributes["gen_ai.tool.type"]).toBe("function")
+    expect(tool.attributes["gen_ai.turn.id"]).toBe("ses_1:1")
+    expect(tool.attributes["gen_ai.step.id"]).toBe("msg_1")
     expect(tool.attributes["gen_ai.tool.call.arguments"]).toBe('{"path":"a.ts"}')
     expect(tool.attributes["gen_ai.tool.call.result"]).toBe("file body")
     expect(tool.attributes["gen_ai.agent.name"]).toBe("build")
@@ -101,11 +118,13 @@ describe("gen_ai flavor end to end", () => {
     seedRun(ctx)
     startStep(ctx)
     handleStepFailed(
-      evt("session.step.failed", { sessionID: "ses_1", assistantMessageID: "msg_1", finish: "content_filter", tokens: tokens(10, 5), error: { type: "api", message: "boom" } }, 2000),
+      evt("session.step.failed", { sessionID: "ses_1", assistantMessageID: "msg_1", finish: "content_filter", tokens: tokens(10, 5), error: { type: "api", message: "boom", status: 503 } }, 2000),
       ctx,
     )
     const llm = tracer.spans.find((span) => span.name === "chat claude-sonnet")!
-    expect(llm.attributes["error.type"]).toBe("content_filter")
+    expect(llm.attributes["error.type"]).toBe("api")
+    expect(llm.attributes["error.message"]).toBe("boom")
+    expect(llm.attributes["error.status"]).toBe(503)
     expect(llm.status.code).toBe(SpanStatusCode.ERROR)
     assertNoOpenInferenceAttrs(llm)
   })
@@ -132,7 +151,7 @@ describe("gen_ai flavor end to end", () => {
 })
 
 describe("gen_ai metrics and log events", () => {
-  test("records the official GenAI histograms and skips the OpenInference token counter", () => {
+  test("records the GenAI inference counters and skips the OpenInference token counter", () => {
     const { ctx, counters, histograms } = genAiCtx()
     seedRun(ctx)
     startStep(ctx, 1500)
@@ -142,31 +161,98 @@ describe("gen_ai metrics and log events", () => {
     )
 
     expect(counters.token.calls).toHaveLength(0)
-    const [input, output] = histograms.tokenUsage.calls
+
+    const [input] = counters.inputTokens.calls
     expect(input!.value).toBe(17)
-    expect(input!.attrs["gen_ai.token.type"]).toBe("input")
+    expect(input!.attrs["gen_ai.token.modality"]).toBe("unknown")
     expect(input!.attrs["gen_ai.operation.name"]).toBe("chat")
     expect(input!.attrs["gen_ai.request.model"]).toBe("claude-sonnet")
     expect(input!.attrs["gen_ai.conversation.id"]).toBe("ses_1")
-    expect(output!.value).toBe(7)
-    expect(output!.attrs["gen_ai.token.type"]).toBe("output")
 
-    const duration = histograms.operationDuration.calls.at(-1)!
+    const [output] = counters.outputTokens.calls
+    expect(output!.value).toBe(7)
+    expect(output!.attrs["gen_ai.token.modality"]).toBe("text")
+
+    expect(counters.cacheReadTokens.calls.map((call) => call.value)).toEqual([3])
+    expect(counters.cacheWriteTokens.calls.map((call) => call.value)).toEqual([4])
+    expect(counters.cacheReadTokens.calls[0]!.attrs["gen_ai.token.modality"]).toBe("unknown")
+
+    const [reasoning] = counters.reasoningTokens.calls
+    expect(reasoning!.value).toBe(2)
+    expect(reasoning!.attrs["gen_ai.token.modality"]).toBeUndefined()
+
+    const duration = histograms.inferenceDuration.calls.at(-1)!
     expect(duration.value).toBe(1.1)
     expect(duration.attrs["gen_ai.operation.name"]).toBe("chat")
     expect(duration.attrs["error.type"]).toBeUndefined()
   })
 
-  test("tags a failed operation duration with error.type", () => {
-    const { ctx, histograms } = genAiCtx()
+  test("skips strictly non-positive token contributions", () => {
+    const { ctx, counters } = genAiCtx()
+    seedRun(ctx)
+    startStep(ctx, 1500)
+    handleStepEnded(
+      evt("session.step.ended", { sessionID: "ses_1", assistantMessageID: "msg_1", finish: "stop", cost: 0, tokens: tokens(0, 0, 0, 0, 0) }, 2600),
+      ctx,
+    )
+    expect(counters.inputTokens.calls).toHaveLength(0)
+    expect(counters.outputTokens.calls).toHaveLength(0)
+    expect(counters.cacheReadTokens.calls).toHaveLength(0)
+    expect(counters.cacheWriteTokens.calls).toHaveLength(0)
+    expect(counters.reasoningTokens.calls).toHaveLength(0)
+  })
+
+  test("tags a failed inference duration with error.type", () => {
+    const { ctx, counters, histograms } = genAiCtx()
     seedRun(ctx)
     startStep(ctx, 1500)
     handleStepFailed(
       evt("session.step.failed", { sessionID: "ses_1", assistantMessageID: "msg_1", finish: "content_filter", error: { type: "api", message: "boom" } }, 2500),
       ctx,
     )
-    expect(histograms.operationDuration.calls.at(-1)!.attrs["error.type"]).toBe("content_filter")
-    expect(histograms.tokenUsage.calls).toHaveLength(0)
+    expect(histograms.inferenceDuration.calls.at(-1)!.attrs["error.type"]).toBe("api")
+    expect(counters.inputTokens.calls).toHaveLength(0)
+  })
+
+  test("records execute_tool.duration instead of the prefixed tool histogram", () => {
+    const { ctx, histograms } = genAiCtx()
+    seedRun(ctx)
+    startStep(ctx)
+    handleToolInputStarted(evt("session.tool.input.started", { sessionID: "ses_1", assistantMessageID: "msg_1", id: "call_1", name: "read" }, 1600), ctx)
+    handleToolCalled(evt("session.tool.called", { sessionID: "ses_1", assistantMessageID: "msg_1", id: "call_1", input: { path: "a.ts" }, executed: false }, 1700), ctx)
+    handleToolSuccess(evt("session.tool.success", { sessionID: "ses_1", assistantMessageID: "msg_1", id: "call_1", content: [{ type: "text", text: "file body" }], executed: false }, 2100), ctx)
+
+    expect(histograms.tool.calls).toHaveLength(0)
+    const [call] = histograms.executeToolDuration.calls
+    expect(call!.value).toBe(0.4)
+    expect(call!.attrs["gen_ai.tool.name"]).toBe("read")
+    expect(call!.attrs["gen_ai.tool.type"]).toBe("function")
+    expect(call!.attrs["gen_ai.agent.name"]).toBe("build")
+    expect(call!.attrs["error.type"]).toBeUndefined()
+  })
+
+  test("tags a failed execute_tool.duration with error.type", () => {
+    const { ctx, histograms } = genAiCtx()
+    seedRun(ctx)
+    startStep(ctx)
+    handleToolInputStarted(evt("session.tool.input.started", { sessionID: "ses_1", assistantMessageID: "msg_1", id: "call_1", name: "bash" }, 1600), ctx)
+    handleToolCalled(evt("session.tool.called", { sessionID: "ses_1", assistantMessageID: "msg_1", id: "call_1", input: { command: "false" }, executed: false }, 1700), ctx)
+    handleToolFailed(
+      evt("session.tool.failed", { sessionID: "ses_1", assistantMessageID: "msg_1", id: "call_1", executed: false, error: { type: "exit_code", message: "1" } }, 2100),
+      ctx,
+    )
+
+    const [call] = histograms.executeToolDuration.calls
+    expect(call!.attrs["error.type"]).toBe("exit_code")
+  })
+
+  test("disables a GenAI metric by its full name without touching the others", () => {
+    const { ctx, counters } = makeCtx("proj_test", ["gen_ai.client.inference.usage.input_tokens"], [], true, {}, "gen_ai")
+    seedRun(ctx)
+    startStep(ctx, 1500)
+    handleStepEnded(evt("session.step.ended", { sessionID: "ses_1", assistantMessageID: "msg_1", finish: "stop", cost: 0, tokens: tokens(10, 5) }, 2600), ctx)
+    expect(counters.inputTokens.calls).toHaveLength(0)
+    expect(counters.outputTokens.calls).toHaveLength(1)
   })
 
   test("leaves the OpenInference counters alone in the default flavor", () => {
@@ -175,12 +261,27 @@ describe("gen_ai metrics and log events", () => {
     startStep(ctx, 1500)
     handleStepEnded(evt("session.step.ended", { sessionID: "ses_1", assistantMessageID: "msg_1", finish: "stop", cost: 0, tokens: tokens(10, 5) }, 2600), ctx)
     expect(counters.token.calls.length).toBeGreaterThan(0)
-    expect(histograms.tokenUsage.calls).toHaveLength(0)
-    expect(histograms.operationDuration.calls).toHaveLength(0)
+    expect(counters.inputTokens.calls).toHaveLength(0)
+    expect(histograms.inferenceDuration.calls).toHaveLength(0)
   })
 
-  test("drops the log events that duplicate a span", () => {
+  test("emits the log events that duplicate a span by default", () => {
     const { ctx, logger } = genAiCtx()
+    seedRun(ctx)
+    startStep(ctx, 1500)
+    handleToolInputStarted(evt("session.tool.input.started", { sessionID: "ses_1", assistantMessageID: "msg_1", id: "call_1", name: "read" }, 1600), ctx)
+    handleToolCalled(evt("session.tool.called", { sessionID: "ses_1", assistantMessageID: "msg_1", id: "call_1", input: { path: "a.ts" }, executed: false }, 1700), ctx)
+    handleToolSuccess(evt("session.tool.success", { sessionID: "ses_1", assistantMessageID: "msg_1", id: "call_1", content: [{ type: "text", text: "file body" }], executed: false }, 2100), ctx)
+    handleStepEnded(evt("session.step.ended", { sessionID: "ses_1", assistantMessageID: "msg_1", finish: "stop", cost: 0, tokens: tokens() }, 2600), ctx)
+
+    const names = logger.records.map((record) => record.attributes?.["event.name"])
+    expect(names).toContain("session.created")
+    expect(names).toContain("api_request")
+    expect(names).toContain("tool_result")
+  })
+
+  test("suppresses them when redundant events are disabled", () => {
+    const { ctx, logger } = makeCtx("proj_test", [], [], true, {}, "gen_ai", true, false)
     seedRun(ctx)
     startStep(ctx, 1500)
     handleToolInputStarted(evt("session.tool.input.started", { sessionID: "ses_1", assistantMessageID: "msg_1", id: "call_1", name: "read" }, 1600), ctx)
@@ -294,5 +395,33 @@ describe("time to first token", () => {
     handleStepEnded(evt("session.step.ended", { sessionID: "ses_1", assistantMessageID: "msg_1", finish: "stop", cost: 0, tokens: tokens() }, 2600), ctx)
     expect(histograms.ttft.calls).toHaveLength(0)
     expect(tracer.spans.find((span) => span.name === "opencode.llm")!.attributes["gen_ai.server.time_to_first_token"]).toBeUndefined()
+  })
+})
+
+describe("gen_ai facts and truncation", () => {
+  test("keeps facts when content capture is off", () => {
+    const { ctx, tracer, logger } = gatedCtx()
+    seedRun(ctx)
+    handleToolInputStarted(evt("session.tool.input.started", { sessionID: "ses_1", assistantMessageID: "msg_1", id: "call_1", name: "bash" }, 1200), ctx)
+    handleToolCalled(evt("session.tool.called", { sessionID: "ses_1", assistantMessageID: "msg_1", id: "call_1", input: { command: "ls -la" }, executed: false }, 1300), ctx)
+    handleToolSuccess(evt("session.tool.success", { sessionID: "ses_1", assistantMessageID: "msg_1", id: "call_1", content: [{ type: "text", text: "listing" }], executed: false }, 1400), ctx)
+    const span = tracer.spans.find((s) => s.name === "execute_tool bash")!
+    expect(span.attributes["tool.command"]).toBe("ls -la")
+    expect(span.attributes["gen_ai.tool.call.arguments"]).toBeUndefined()
+    expect(span.attributes["gen_ai.tool.call.result"]).toBeUndefined()
+    const result = logger.records.find((record) => record.body === "tool_result")!
+    expect(result.attributes?.["tool.command"]).toBe("ls -la")
+  })
+
+  test("marks truncated content without leaking OpenInference keys", () => {
+    const { ctx, tracer } = genAiCtx()
+    seedRun(ctx)
+    startStep(ctx, 1500)
+    handleTextEnded(evt("session.text.ended", { sessionID: "ses_1", assistantMessageID: "msg_1", ordinal: 0, text: "x".repeat(20_001) }, 1600), ctx)
+    handleStepEnded(evt("session.step.ended", { sessionID: "ses_1", assistantMessageID: "msg_1", finish: "stop", cost: 0, tokens: tokens() }, 2600), ctx)
+    const span = tracer.spans.find((s) => s.name === "chat claude-sonnet")!
+    expect(span.attributes["content.output.truncated"]).toBe(true)
+    expect(span.attributes["content.output.original_length"]).toBe(20_001)
+    assertNoOpenInferenceAttrs(span)
   })
 })

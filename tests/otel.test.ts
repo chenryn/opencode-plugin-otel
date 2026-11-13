@@ -9,7 +9,7 @@ import { OTLPMetricExporter as OTLPProtoMetricExporter } from "@opentelemetry/ex
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-grpc"
 import { OTLPTraceExporter as OTLPHttpTraceExporter } from "@opentelemetry/exporter-trace-otlp-http"
 import { OTLPTraceExporter as OTLPProtoTraceExporter } from "@opentelemetry/exporter-trace-otlp-proto"
-import { buildResource, forceFlushOtel, setupOtel, type OtelProviders } from "../src/otel.ts"
+import { buildResource, createInstruments, forceFlushOtel, setupOtel, type OtelProviders } from "../src/otel.ts"
 
 let providers: OtelProviders | undefined
 
@@ -143,6 +143,17 @@ describe("setupOtel", () => {
     }
   })
 
+  test("exposes export health and the self-monitoring instruments", async () => {
+    providers = await setupOtel("http://collector:4318", "http/json", 60000, 5000, "1.2.3")
+    expect(providers.health.failures.size).toBe(0)
+    const instruments = createInstruments("opencode.")
+    expect(instruments.exporterFailureCounter).toBeDefined()
+    expect(instruments.exporterAuthRetryCounter).toBeDefined()
+    expect(instruments.eventDispatchErrorCounter).toBeDefined()
+    expect(instruments.flushFailureCounter).toBeDefined()
+    expect(instruments.flushDurationHistogram).toBeDefined()
+  })
+
   test("does not send inherited OTLP credentials when the accepted setup has no headers", async () => {
     const previous = process.env["OTEL_EXPORTER_OTLP_HEADERS"]
     const previousMetrics = process.env["OTEL_EXPORTER_OTLP_METRICS_HEADERS"]
@@ -190,5 +201,19 @@ describe("forceFlushOtel", () => {
     await forceFlushOtel(fakeProviders)
 
     expect(calls.sort()).toEqual(["logs", "metrics", "traces"])
+    expect(await forceFlushOtel(fakeProviders)).toMatchObject({ ok: true, failed: 0 })
+  })
+
+  test("reports a flush where one provider fails", async () => {
+    const fakeProviders = {
+      meterProvider: { forceFlush: async () => {} },
+      loggerProvider: { forceFlush: async () => { throw new Error("logs down") } },
+      tracerProvider: { forceFlush: async () => {} },
+    } as unknown as OtelProviders
+
+    const outcome = await forceFlushOtel(fakeProviders)
+    expect(outcome.ok).toBe(false)
+    expect(outcome.failed).toBe(1)
+    expect(outcome.durationMs).toBeGreaterThanOrEqual(0)
   })
 })

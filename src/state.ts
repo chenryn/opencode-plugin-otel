@@ -50,8 +50,9 @@ export async function acquireSharedOtel(config: PluginConfig, version: string): 
     // A hot-reloaded plugin can reuse an instrument set created by an older
     // build. Backfill instruments added since then instead of dropping their
     // measurements until the process restarts.
-    if (existing.instruments && !existing.instruments.operationDurationHistogram) {
-      existing.instruments = { ...createInstruments(config.metricPrefix, version), ...existing.instruments }
+    const instruments = createInstruments(config.metricPrefix, version)
+    if (existing.instruments && Object.keys(instruments).some((name) => !(name in existing.instruments!))) {
+      existing.instruments = { ...instruments, ...existing.instruments }
     }
     existing.refs += 1
     return existing
@@ -131,6 +132,8 @@ export function acquireTracingState(): TracingState {
       countedMessages: new Set(),
       sessionProjects: new Map(),
       sessionIdentity: new Map(),
+      sessionTurns: new Map(),
+      sessionRetries: new Map(),
       stepOutputs: new Map(),
       pendingPrompts: new Map(),
       activePrompts: new Map(),

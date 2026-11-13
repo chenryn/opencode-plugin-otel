@@ -1,6 +1,6 @@
 import { describe, test, expect } from "bun:test"
 import { SpanStatusCode } from "@opentelemetry/api"
-import { handleToolCalled, handleToolFailed, handleToolInputStarted, handleToolSuccess } from "../../src/handlers/tool.ts"
+import { handleToolCalled, handleToolFailed, handleToolInputStarted, handleToolSuccess, toolFacts } from "../../src/handlers/tool.ts"
 import { handleExecutionStarted, handleSessionCreated } from "../../src/handlers/session.ts"
 import { makeCtx, evt, recordSpanContext } from "../helpers.ts"
 
@@ -134,9 +134,12 @@ describe("handleToolFailed", () => {
     expect(histograms.tool.calls[0]!.attrs["success"]).toBe(false)
     expect(logger.records.at(-1)!.attributes?.["duration_ms"]).toBe(200)
     expect(logger.records.at(-1)!.attributes?.["error"]).toBe("tool.execution: nope")
+    expect(logger.records.at(-1)!.attributes?.["error.type"]).toBe("tool.execution")
+    expect(logger.records.at(-1)!.attributes?.["error.message"]).toBe("nope")
     const span = tracer.spans.find((s) => s.name === "opencode.tool.bash")!
     expect(span.ended).toBe(true)
     expect(span.status.code).toBe(SpanStatusCode.ERROR)
+    expect(span.attributes["error.type"]).toBe("tool.execution")
   })
 
   test("records a failed provider-executed tool", () => {
@@ -193,5 +196,88 @@ describe("handleToolFailed", () => {
     expect(span.status.code).toBe(SpanStatusCode.ERROR)
     expect(histograms.tool.calls[0]!.value).toBe(100)
     expect(histograms.tool.calls[0]!.attrs["success"]).toBe(false)
+  })
+})
+
+describe("tool facts", () => {
+  test("emits the verbatim command for shell tools", () => {
+    const { ctx, tracer, logger } = makeCtx()
+    seed(ctx)
+    handleToolInputStarted(inputStarted("call_1", "bash"), ctx)
+    handleToolCalled(called("call_1", { command: "ls -la" }, local), ctx)
+    handleToolSuccess(succeeded("call_1", "listing", local), ctx)
+    const span = tracer.spans.find((s) => s.name === "opencode.tool.bash")!
+    expect(span.attributes["tool.command"]).toBe("ls -la")
+    const result = logger.records.find((record) => record.body === "tool_result")!
+    expect(result.attributes?.["tool.command"]).toBe("ls -la")
+  })
+
+  test("emits file.operation and file.path for file tools", () => {
+    const { ctx, tracer, logger } = makeCtx()
+    seed(ctx)
+    handleToolInputStarted(inputStarted("call_read", "read"), ctx)
+    handleToolCalled(called("call_read", { path: "/tmp/a.ts" }, local), ctx)
+    handleToolSuccess(succeeded("call_read", "contents", local), ctx)
+    const span = tracer.spans.find((s) => s.name === "opencode.tool.read")!
+    expect(span.attributes["file.operation"]).toBe("read")
+    expect(span.attributes["file.path"]).toBe("/tmp/a.ts")
+    const result = logger.records.find((record) => record.body === "tool_result")!
+    expect(result.attributes?.["file.operation"]).toBe("read")
+    expect(result.attributes?.["file.path"]).toBe("/tmp/a.ts")
+  })
+
+  test("emits file.paths for multi-path edits", () => {
+    const { ctx, tracer } = makeCtx()
+    seed(ctx)
+    handleToolInputStarted(inputStarted("call_edit", "multiedit"), ctx)
+    handleToolCalled(called("call_edit", { edits: [{ path: "/tmp/a.ts" }, { path: "/tmp/b.ts" }] }, local), ctx)
+    const span = tracer.spans.find((s) => s.name === "opencode.tool.multiedit")!
+    expect(span.attributes["file.operation"]).toBe("edit")
+    expect(span.attributes["file.paths"]).toEqual(["/tmp/a.ts", "/tmp/b.ts"])
+    expect(span.attributes["file.path"]).toBeUndefined()
+  })
+
+  test("omits facts when the tool is not mapped", () => {
+    const { ctx, tracer } = makeCtx()
+    seed(ctx)
+    handleToolInputStarted(inputStarted("call_1", "webfetch"), ctx)
+    handleToolCalled(called("call_1", { url: "https://example.com" }, local), ctx)
+    const span = tracer.spans.find((s) => s.name === "opencode.tool.webfetch")!
+    expect(span.attributes["file.operation"]).toBeUndefined()
+    expect(span.attributes["tool.command"]).toBeUndefined()
+  })
+
+  test("respects captureToolFacts=false", () => {
+    const { ctx, tracer, logger } = makeCtx("proj_test", [], [], true, {}, "openinference", true, true, false)
+    seed(ctx)
+    handleToolInputStarted(inputStarted("call_1", "bash"), ctx)
+    handleToolCalled(called("call_1", { command: "ls -la" }, local), ctx)
+    handleToolSuccess(succeeded("call_1", "listing", local), ctx)
+    const span = tracer.spans.find((s) => s.name === "opencode.tool.bash")!
+    expect(span.attributes["tool.command"]).toBeUndefined()
+    const result = logger.records.find((record) => record.body === "tool_result")!
+    expect(result.attributes?.["tool.command"]).toBeUndefined()
+  })
+
+  test("keeps the call and result when input.started was missed", () => {
+    const { ctx, tracer, logger } = makeCtx()
+    seed(ctx)
+    handleToolCalled(called("call_1", { path: "/tmp/a.ts" }, local), ctx)
+    handleToolSuccess(succeeded("call_1", "contents", local), ctx)
+    expect(tracer.spans.some((s) => s.name === "opencode.tool.unknown")).toBe(true)
+    const result = logger.records.find((record) => record.body === "tool_result")!
+    expect(result.attributes?.["success"]).toBe(true)
+    expect(result.attributes?.["file.operation"]).toBeUndefined()
+  })
+})
+
+describe("toolFacts", () => {
+  test("maps tools and normalizes namespaced tool ids", () => {
+    expect(toolFacts("filesystem.read", { path: "a.ts" })).toEqual({ operation: "read", paths: ["a.ts"] })
+    expect(toolFacts("write", { filePath: "b.ts" })).toEqual({ operation: "write", paths: ["b.ts"] })
+    expect(toolFacts("glob", { pattern: "**/*.ts" })).toEqual({ operation: "glob" })
+    expect(toolFacts("grep", { pattern: "x" })).toEqual({ operation: "search" })
+    expect(toolFacts("bash", { command: "pwd" })).toEqual({ command: "pwd" })
+    expect(toolFacts("webfetch", { url: "x" })).toBeUndefined()
   })
 })

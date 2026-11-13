@@ -76,6 +76,8 @@ describe("loadConfig", () => {
     "OPENCODE_DISABLE_LOGS",
     "OPENCODE_CAPTURE_PROMPT_IN_LOGS",
     "OPENCODE_CAPTURE_MODEL_CONTEXT",
+    "OPENCODE_CAPTURE_TOOL_FACTS",
+    "OPENCODE_EMIT_REDUNDANT_EVENTS",
     "OPENCODE_DISABLE_TRACES",
     "OPENCODE_TRACE_PROPAGATION_PROVIDERS",
     "OPENCODE_SEMCONV",
@@ -140,6 +142,28 @@ describe("loadConfig", () => {
   test("capturePromptInLogs is true when OPENCODE_CAPTURE_PROMPT_IN_LOGS is set", () => {
     process.env["OPENCODE_CAPTURE_PROMPT_IN_LOGS"] = "1"
     expect(loadConfig().capturePromptInLogs).toBe(true)
+  })
+
+  test("emits redundant log events by default", () => {
+    expect(loadConfig().emitRedundantEvents).toBe(true)
+  })
+
+  test("OPENCODE_EMIT_REDUNDANT_EVENTS disables redundant events with common false spellings", () => {
+    for (const value of ["0", "false", "FALSE", "no", "off"]) {
+      process.env["OPENCODE_EMIT_REDUNDANT_EVENTS"] = value
+      expect(loadConfig().emitRedundantEvents).toBe(false)
+    }
+    for (const value of ["1", "true", "yes"]) {
+      process.env["OPENCODE_EMIT_REDUNDANT_EVENTS"] = value
+      expect(loadConfig().emitRedundantEvents).toBe(true)
+    }
+  })
+
+  test("the emitRedundantEvents option wins over the environment", () => {
+    process.env["OPENCODE_EMIT_REDUNDANT_EVENTS"] = "0"
+    expect(loadConfig({ emitRedundantEvents: true }).emitRedundantEvents).toBe(true)
+    delete process.env["OPENCODE_EMIT_REDUNDANT_EVENTS"]
+    expect(loadConfig({ emitRedundantEvents: false }).emitRedundantEvents).toBe(false)
   })
 
   test("reads custom endpoint", () => {
@@ -213,6 +237,14 @@ describe("loadConfig", () => {
     process.env["OPENCODE_CAPTURE_MODEL_CONTEXT"] = "1"
     expect(loadConfig().captureModelContext).toBe(true)
     expect(loadConfig({ captureModelContext: false }).captureModelContext).toBe(false)
+  })
+
+  test("captures tool facts by default and accepts an opt-out", () => {
+    expect(loadConfig().captureToolFacts).toBe(true)
+    expect(loadConfig({ captureToolFacts: false }).captureToolFacts).toBe(false)
+    process.env["OPENCODE_CAPTURE_TOOL_FACTS"] = "0"
+    expect(loadConfig().captureToolFacts).toBe(false)
+    expect(loadConfig({ captureToolFacts: true }).captureToolFacts).toBe(true)
   })
 
   test("does not set OTEL_EXPORTER_OTLP_HEADERS when OPENCODE_OTLP_HEADERS is unset", () => {
@@ -398,6 +430,7 @@ describe("loadConfig options", () => {
     "OPENCODE_DISABLE_LOGS",
     "OPENCODE_DISABLE_TRACES",
     "OPENCODE_TRACE_PROPAGATION_PROVIDERS",
+    "OPENCODE_EMIT_REDUNDANT_EVENTS",
     "OPENCODE_SEMCONV",
     "OTEL_EXPORTER_OTLP_HEADERS",
     "OTEL_RESOURCE_ATTRIBUTES",

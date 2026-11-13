@@ -16,6 +16,10 @@ export type PluginConfig = {
   logsEnabled: boolean
   capturePromptInLogs: boolean
   captureModelContext: boolean
+  /** Emit factual tool metadata (verbatim command, file paths); independent of content capture. */
+  captureToolFacts: boolean
+  /** Emit log events that duplicate a span; the `gen_ai` flavor suppresses them when false. */
+  emitRedundantEvents: boolean
   logLevel: string | undefined
   endpoint: string
   protocol: "grpc" | "http/protobuf" | "http/json"
@@ -63,6 +67,8 @@ export type OtelPluginOptions = {
   logsEnabled?: boolean
   capturePromptInLogs?: boolean
   captureModelContext?: boolean
+  captureToolFacts?: boolean
+  emitRedundantEvents?: boolean
   logLevel?: string
   endpoint?: string
   protocol?: "grpc" | "http/protobuf" | "http/json"
@@ -129,6 +135,18 @@ export function parseEnvInt(key: string, fallback: number): number {
 /** Returns `true` when the environment variable is present and non-empty. */
 function hasNonEmptyEnv(key: string): boolean {
   return !!process.env[key]
+}
+
+const DISABLED_ENV_VALUES = new Set(["0", "false", "no", "off"])
+
+/**
+ * Reads an opt-out boolean environment variable. Unset or empty values fall back to
+ * `fallback`; common false spellings disable the behavior and anything else enables it.
+ */
+function readEnvBoolean(key: string, fallback: boolean): boolean {
+  const raw = process.env[key]
+  if (!raw) return fallback
+  return !DISABLED_ENV_VALUES.has(raw.trim().toLowerCase())
 }
 
 function splitList(raw: string | undefined): string[] {
@@ -224,6 +242,10 @@ export function loadConfig(options: OtelPluginOptions = {}): PluginConfig {
     logsEnabled: pickBoolean(resolvedOptions.logsEnabled) ?? !hasNonEmptyEnv("OPENCODE_DISABLE_LOGS"),
     capturePromptInLogs: pickBoolean(resolvedOptions.capturePromptInLogs) ?? hasNonEmptyEnv("OPENCODE_CAPTURE_PROMPT_IN_LOGS"),
     captureModelContext: pickBoolean(resolvedOptions.captureModelContext) ?? hasNonEmptyEnv("OPENCODE_CAPTURE_MODEL_CONTEXT"),
+    captureToolFacts: pickBoolean(resolvedOptions.captureToolFacts)
+      ?? readEnvBoolean("OPENCODE_CAPTURE_TOOL_FACTS", true),
+    emitRedundantEvents: pickBoolean(resolvedOptions.emitRedundantEvents)
+      ?? readEnvBoolean("OPENCODE_EMIT_REDUNDANT_EVENTS", true),
     logLevel: pickString(resolvedOptions.logLevel),
     endpoint: pickString(resolvedOptions.endpoint) ?? process.env["OPENCODE_OTLP_ENDPOINT"] ?? "http://localhost:4317",
     protocol,

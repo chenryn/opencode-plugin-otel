@@ -19,6 +19,34 @@ type SelectAggregationTemporality = NonNullable<PushMetricExporter["selectAggreg
 
 export type HeadersMap = Record<string, string>
 
+/** OTLP signal an export belongs to, used for low-cardinality self-monitoring attributes. */
+export type ExportSignal = "traces" | "metrics" | "logs"
+
+/** Cause of an export failure, grouped so dashboards never key on a message string. */
+export type ExportErrorType = "auth" | "unavailable" | "timeout" | "other"
+
+/** Observer notified about export outcomes; implemented by the buffered health counters. */
+export type ExportObserver = {
+  failure?(signal: ExportSignal, error: unknown): void
+  authRetry?(signal: ExportSignal): void
+}
+
+/**
+ * Classifies an export error into a bounded set of causes. Authentication wins over transport
+ * classification so a 401 from a proxy is still reported as `auth`.
+ */
+export function classifyExportError(error: unknown): ExportErrorType {
+  if (isAuthFailure(error)) return "auth"
+  const err = error as Record<string, unknown> | undefined
+  const numericStatus = Number(err?.["status"] ?? err?.["statusCode"] ?? err?.["code"])
+  if ([14, 4].includes(numericStatus) || err?.["code"] === "ECONNREFUSED" || err?.["code"] === "ENOTFOUND") {
+    return numericStatus === 4 ? "timeout" : "unavailable"
+  }
+  if (err?.["code"] === "ETIMEDOUT") return "timeout"
+  const message = error instanceof Error ? error.message : String(error ?? "")
+  return /deadline|timed? ?out/i.test(message) ? "timeout" : "other"
+}
+
 export function parseOtlpHeaders(raw: string | undefined): HeadersMap {
   if (!raw) return {}
   const headers: HeadersMap = {}
@@ -127,13 +155,14 @@ export class RefreshingMetricExporter implements PushMetricExporter {
   constructor(
     private readonly createExporter: (headers: HeadersMap) => PushMetricExporter,
     private readonly dynamicHeaders: DynamicHeaders,
+    private readonly observer?: ExportObserver,
   ) {
     this.exporter = createExporter(dynamicHeaders.current())
     this.headersVersion = dynamicHeaders.currentVersion()
   }
 
   export(metrics: ResourceMetrics, resultCallback: (result: ExportResult) => void): void {
-    exportWithAuthRetry(this, metrics, resultCallback)
+    exportWithAuthRetry(this, metrics, resultCallback, "metrics", this.observer)
   }
 
   forceFlush(): Promise<void> {
@@ -181,13 +210,14 @@ export class RefreshingSpanExporter implements SpanExporter {
   constructor(
     private readonly createExporter: (headers: HeadersMap) => SpanExporter,
     private readonly dynamicHeaders: DynamicHeaders,
+    private readonly observer?: ExportObserver,
   ) {
     this.exporter = createExporter(dynamicHeaders.current())
     this.headersVersion = dynamicHeaders.currentVersion()
   }
 
   export(spans: ReadableSpan[], resultCallback: (result: ExportResult) => void): void {
-    exportWithAuthRetry(this, spans, resultCallback)
+    exportWithAuthRetry(this, spans, resultCallback, "traces", this.observer)
   }
 
   forceFlush(): Promise<void> {
@@ -225,13 +255,14 @@ export class RefreshingLogExporter implements LogRecordExporter {
   constructor(
     private readonly createExporter: (headers: HeadersMap) => LogRecordExporter,
     private readonly dynamicHeaders: DynamicHeaders,
+    private readonly observer?: ExportObserver,
   ) {
     this.exporter = createExporter(dynamicHeaders.current())
     this.headersVersion = dynamicHeaders.currentVersion()
   }
 
   export(logs: ReadableLogRecord[], resultCallback: (result: ExportResult) => void): void {
-    exportWithAuthRetry(this, logs, resultCallback)
+    exportWithAuthRetry(this, logs, resultCallback, "logs", this.observer)
   }
 
   shutdown(): Promise<void> {
@@ -267,16 +298,24 @@ function exportWithAuthRetry<T>(
   },
   items: T,
   resultCallback: (result: ExportResult) => void,
+  signal: ExportSignal,
+  observer?: ExportObserver,
 ): void {
+  const finish = (result: ExportResult) => {
+    if (result.code === ExportResultCode.FAILED) observer?.failure?.(signal, result.error)
+    resultCallback(result)
+  }
   wrapper._exporter().export(items, (result) => {
     if (result.code !== ExportResultCode.FAILED || !isAuthFailure(result.error)) {
-      resultCallback(result)
+      finish(result)
       return
     }
+    observer?.failure?.(signal, result.error)
+    observer?.authRetry?.(signal)
     wrapper._refreshHeaders()
       .then((version) => {
         if (version !== wrapper._headersVersion()) wrapper._replaceExporter(version)
-        wrapper._exporter().export(items, resultCallback)
+        wrapper._exporter().export(items, finish)
       })
       .catch((error: unknown) => {
         resultCallback({ code: ExportResultCode.FAILED, error: error instanceof Error ? error : new Error(String(error)) })

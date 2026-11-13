@@ -93,6 +93,8 @@ describe("handleExecutionStarted", () => {
     const parentRun = tracer.spans.find((s) => s.attributes["session.id"] === "ses_1")!
     const subRun = tracer.spans.find((s) => s.attributes["session.id"] === "sub_1")!
     expect(subRun.parentSpan).toBe(parentRun)
+    expect(subRun.attributes["parent_session_id"]).toBe("ses_1")
+    expect(parentRun.attributes["parent_session_id"]).toBeUndefined()
   })
 
   test("lazily initializes and counts a session with no session.created event", () => {
@@ -222,11 +224,48 @@ describe("handleExecutionEnded", () => {
 
 describe("handleSessionStatus", () => {
   test("counts durable retry events once rather than retry status", () => {
-    const { ctx, counters } = makeCtx()
+    const { ctx, counters } = makeCtx("proj_test", [], [], true, {}, "gen_ai")
     handleSessionStatus(evt("session.status", { sessionID: "ses_1", status: { type: "retry", attempt: 1, message: "m", next: 2 } }), ctx)
     expect(counters.retry.calls).toHaveLength(0)
     handleRetryScheduled(evt("session.retry.scheduled", { sessionID: "ses_1", assistantMessageID: "m", attempt: 1, at: 2, error: { type: "x", message: "y" } }), ctx)
     expect(counters.retry.calls).toHaveLength(1)
+    const attrs = counters.retry.calls[0]!.attrs
+    expect(attrs["session.id"]).toBe("ses_1")
+    expect(attrs["gen_ai.conversation.id"]).toBe("ses_1")
+    expect(attrs["retry.attempt"]).toBe(1)
+    expect(attrs["error.type"]).toBe("x")
+    expect(attrs["session.retry.count"]).toBeUndefined()
+  })
+
+  test("records the per-execution retry count on the run span", () => {
+    const { ctx, tracer } = makeCtx()
+    handleSessionCreated(evt("session.created", { sessionID: "ses_1" }), ctx)
+    handleExecutionStarted(evt("session.execution.started", { sessionID: "ses_1" }), ctx)
+    const run = tracer.spans.find((span) => span.attributes["session.id"] === "ses_1")!
+    for (const attempt of [1, 2]) {
+      handleRetryScheduled(evt("session.retry.scheduled", {
+        sessionID: "ses_1",
+        assistantMessageID: "m",
+        attempt,
+        at: 2,
+        error: { type: "ProviderError", message: "rate limited", status: 429 },
+      }, 2000 + attempt, `retry:${attempt}`), ctx)
+    }
+    expect(run.attributes["retry.attempt"]).toBe(2)
+    expect(run.attributes["session.retry.count"]).toBe(2)
+    expect(run.attributes["error.type"]).toBe("ProviderError")
+    expect(run.attributes["error.status"]).toBe(429)
+  })
+
+  test("tolerates retries without a run span and resets the count per execution", () => {
+    const { ctx, tracer } = makeCtx("proj_test", [], ["session"])
+    handleSessionCreated(evt("session.created", { sessionID: "ses_1" }), ctx)
+    handleExecutionStarted(evt("session.execution.started", { sessionID: "ses_1" }), ctx)
+    handleRetryScheduled(evt("session.retry.scheduled", { sessionID: "ses_1", assistantMessageID: "m", attempt: 1, at: 2, error: { type: "x", message: "y" } }), ctx)
+    expect(ctx.tracing.sessionRetries.get("ses_1")).toBe(1)
+    expect(tracer.spans).toHaveLength(0)
+    handleExecutionStarted(evt("session.execution.started", { sessionID: "ses_1" }), ctx)
+    expect(ctx.tracing.sessionRetries.has("ses_1")).toBe(false)
   })
 
   test("idle records duration and session totals then clears state", () => {
@@ -267,5 +306,86 @@ describe("handleSessionIdle", () => {
     finalizeSession("ses_1", ctx)
     finalizeSession("ses_1", ctx)
     expect(histograms.sessionDuration.calls).toHaveLength(1)
+  })
+})
+
+describe("skills", () => {
+  test("records skill names on the prompt event and the run span", () => {
+    const { ctx, logger, tracer } = makeCtx()
+    handleSessionCreated(evt("session.created", { sessionID: "ses_1", projectID: "p" }), ctx)
+    handlePromptEnqueued(evt("session.inbox.enqueued", {
+      sessionID: "ses_1",
+      inboxID: "msg_1",
+      item: {
+        type: "user",
+        payload: { text: "review this", skills: [{ id: "sk_1", name: "review" }, { id: "sk_2", name: "test" }] },
+        delivery: "queue",
+      },
+    }), ctx, false)
+    const prompt = logger.records.find((record) => record.body === "user_prompt")!
+    expect(prompt.attributes?.["skill.name"]).toEqual(["review", "test"])
+    handleExecutionStarted(evt("session.execution.started", { sessionID: "ses_1" }), ctx)
+    expect(tracer.spans.at(-1)?.attributes["skill.name"]).toEqual(["review", "test"])
+  })
+
+  test("writes no skill attribute when the prompt has none", () => {
+    const { ctx, logger, tracer } = makeCtx()
+    handleSessionCreated(evt("session.created", { sessionID: "ses_1", projectID: "p" }), ctx)
+    handlePromptEnqueued(evt("session.inbox.enqueued", {
+      sessionID: "ses_1",
+      inboxID: "msg_1",
+      item: { type: "user", payload: { text: "plain", skills: [] }, delivery: "queue" },
+    }), ctx, false)
+    const prompt = logger.records.find((record) => record.body === "user_prompt")!
+    expect(prompt.attributes?.["skill.name"]).toBeUndefined()
+    expect(ctx.tracing.pendingPrompts.get("ses_1")![0]!.skills).toBeUndefined()
+    handleExecutionStarted(evt("session.execution.started", { sessionID: "ses_1" }), ctx)
+    expect(tracer.spans.at(-1)?.attributes["skill.name"]).toBeUndefined()
+  })
+
+  test("merges skill names for a steering prompt", () => {
+    const { ctx } = makeCtx()
+    handleSessionCreated(evt("session.created", { sessionID: "ses_1", projectID: "p" }), ctx)
+    handlePromptEnqueued(evt("session.inbox.enqueued", {
+      sessionID: "ses_1",
+      inboxID: "first",
+      item: { type: "user", payload: { text: "first", skills: [{ id: "s1", name: "review" }] }, delivery: "steer" },
+    }), ctx, false)
+    handleExecutionStarted(evt("session.execution.started", { sessionID: "ses_1" }), ctx)
+    handlePromptEnqueued(evt("session.inbox.enqueued", {
+      sessionID: "ses_1",
+      inboxID: "steering",
+      item: { type: "user", payload: { text: "steering", skills: [{ id: "s1", name: "review" }, { id: "s2", name: "test" }] }, delivery: "steer" },
+    }), ctx, false)
+    expect(ctx.tracing.activePrompts.get("ses_1")?.skills).toEqual(["review", "test"])
+  })
+
+  test("deduplicates and caps skill names", () => {
+    const { ctx, logger } = makeCtx()
+    const skills = Array.from({ length: 25 }, (_, index) => ({ id: `s${index}`, name: `skill-${index}` }))
+    handlePromptEnqueued(evt("session.inbox.enqueued", {
+      sessionID: "ses_1",
+      inboxID: "msg_1",
+      item: { type: "user", payload: { text: "x", skills: [skills[0]!, ...skills] }, delivery: "queue" },
+    }), ctx, false)
+    const prompt = logger.records.find((record) => record.body === "user_prompt")!
+    expect((prompt.attributes?.["skill.name"] as string[]).length).toBe(20)
+  })
+})
+
+describe("prompt truncation", () => {
+  test("caps the prompt attribute and keeps the original length", () => {
+    const { ctx, logger } = makeCtx()
+    const text = "p".repeat(20_001)
+    handlePromptEnqueued(evt("session.inbox.enqueued", {
+      sessionID: "ses_1",
+      inboxID: "msg_1",
+      item: { type: "user", payload: { text }, delivery: "queue" },
+    }), ctx, true)
+    const prompt = logger.records.find((record) => record.body === "user_prompt")!
+    expect(String(prompt.attributes?.["prompt"]).length).toBe(20_000)
+    expect(prompt.attributes?.["prompt.truncated"]).toBe(true)
+    expect(prompt.attributes?.["prompt.original_length"]).toBe(20_001)
+    expect(prompt.attributes?.["prompt_length"]).toBe(20_001)
   })
 })

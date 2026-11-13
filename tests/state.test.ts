@@ -37,8 +37,11 @@ describe("multi-location telemetry", () => {
     globals[key] = fake
     try {
       const shared = await acquireSharedOtel(config, "2.0.0")
-      expect(shared.instruments.tokenUsageHistogram).toBeDefined()
-      expect(shared.instruments.operationDurationHistogram).toBeDefined()
+      expect(shared.instruments.inferenceDurationHistogram).toBeDefined()
+      expect(shared.instruments.inputTokensCounter).toBeDefined()
+      expect(shared.instruments.executeToolDurationHistogram).toBeDefined()
+      expect(shared.instruments.exporterFailureCounter).toBeDefined()
+      expect(shared.instruments.flushDurationHistogram).toBeDefined()
       expect(shared.instruments.sessionCounter).toBe(stale.sessionCounter as never)
     } finally {
       globals[key] = previous

@@ -1,10 +1,24 @@
 import { SeverityNumber } from "@opentelemetry/api-logs"
-import { SpanKind, SpanStatusCode } from "@opentelemetry/api"
+import { SpanKind, SpanStatusCode, type Counter } from "@opentelemetry/api"
 import type { EventOf, HandlerContext, SessionTotals } from "../types.ts"
-import { GEN_AI_METRIC, llmEndAttrs, llmFailAttrs, llmSpanName, llmStartAttrs, signalAttrs } from "../semconv.ts"
+import {
+  costAttrs,
+  errorAttrs,
+  GEN_AI_METRIC,
+  inferenceMetricAttrs,
+  llmEndAttrs,
+  llmFailAttrs,
+  llmSpanName,
+  llmStartAttrs,
+  OUTPUT_TOKEN_MODALITY,
+  PROMPT_TOKEN_MODALITY,
+  signalAttrs,
+  withTokenModality,
+} from "../semconv.ts"
 import { ensureSession } from "./session.ts"
 import { applyModelContext } from "./chat-headers.ts"
 import {
+  currentTurnID,
   errorSummary,
   genAiProviderName,
   isMetricEnabled,
@@ -18,6 +32,9 @@ import {
 function billedTokens(tokens: { input: number; output: number; reasoning: number } | undefined): number {
   return (tokens?.input ?? 0) + (tokens?.output ?? 0) + (tokens?.reasoning ?? 0)
 }
+
+/** Memory-safety cap for streamed assistant text; attribute-level truncation is separate. */
+const STEP_OUTPUT_BUFFER_LIMIT = 64_000
 
 function allTokens(tokens: { input: number; output: number; reasoning: number; cache: { read: number; write: number } } | undefined): number {
   if (!tokens) return 0
@@ -47,6 +64,7 @@ export function handleStepStarted(e: EventOf<"session.step.started">, ctx: Handl
   const d = e.data
   const totals = ensureSession(d.sessionID, e.created, ctx)
   const agentType = totals.agentType
+  const turnID = currentTurnID(d.sessionID, ctx)
   setBoundedMap(ctx.tracing.stepMeta, d.assistantMessageID, {
     sessionID: d.sessionID,
     startMs: d.started ?? e.created,
@@ -54,6 +72,7 @@ export function handleStepStarted(e: EventOf<"session.step.started">, ctx: Handl
     agentType,
     modelID: d.model.id,
     providerID: d.model.providerID,
+    ...(turnID ? { turnID } : {}),
   })
   if (totals && totals.agent !== d.agent) {
     setBoundedMap(ctx.tracing.sessionTotals, d.sessionID, { ...totals, agent: d.agent })
@@ -68,6 +87,8 @@ export function handleStepStarted(e: EventOf<"session.step.started">, ctx: Handl
       agentType,
       providerID: d.model.providerID,
       modelID: d.model.id,
+      ...(turnID ? { turnID } : {}),
+      stepID: d.assistantMessageID,
       ...(promptText ? { promptText } : {}),
     }),
     ...ctx.commonAttrs,
@@ -115,7 +136,7 @@ export function handleReasoningStarted(e: EventOf<"session.reasoning.started">, 
 export function handleTextEnded(e: EventOf<"session.text.ended">, ctx: HandlerContext) {
   const { assistantMessageID, ordinal, text } = e.data
   const output = ctx.tracing.stepOutputs.get(assistantMessageID) ?? new Map<number, string>()
-  if (output.size < 32 || output.has(ordinal)) output.set(ordinal, text.slice(0, 64_000))
+  if (output.size < 32 || output.has(ordinal)) output.set(ordinal, text.slice(0, STEP_OUTPUT_BUFFER_LIMIT))
   setBoundedMap(ctx.tracing.stepOutputs, assistantMessageID, output)
 }
 
@@ -134,7 +155,7 @@ function countMessage(messageID: string, sessionID: string, modelID: string, pro
 function outputText(messageID: string, ctx: HandlerContext): string | undefined {
   const output = ctx.tracing.stepOutputs.get(messageID)
   if (!output) return undefined
-  return [...output].sort(([a], [b]) => a - b).map(([, text]) => text).join("\n").slice(0, 64_000)
+  return [...output].sort(([a], [b]) => a - b).map(([, text]) => text).join("\n")
 }
 
 /** Records the TTFT histogram and returns the latency in milliseconds for span attributes. */
@@ -152,7 +173,7 @@ function recordTtft(
   // existed. Skip the histogram rather than failing the whole step handler.
   if (ctx.instruments.ttftHistogram && isMetricEnabled(GEN_AI_METRIC.timeToFirstToken, ctx)) {
     const attrs = ctx.semconv === "gen_ai"
-      ? { ...ctx.commonAttrs, ...signalAttrs("gen_ai", { sessionID, agent, modelID, providerID }), "gen_ai.operation.name": "chat" }
+      ? { ...ctx.commonAttrs, ...inferenceMetricAttrs({ sessionID, modelID, providerID, agent }) }
       : {
           ...ctx.commonAttrs,
           "session.id": sessionID,
@@ -216,7 +237,7 @@ export function handleStepEnded(e: EventOf<"session.step.ended">, ctx: HandlerCo
       provider: providerID,
       "gen_ai.provider.name": genAiProviderName(providerID),
       ...signalAttrs(ctx.semconv, { agent, agentType }),
-      cost_usd: d.cost,
+      ...costAttrs(ctx.semconv, d.cost),
       duration_ms: durationMs,
       input_tokens: d.tokens.input,
       output_tokens: d.tokens.output,
@@ -248,7 +269,7 @@ export function handleStepFailed(e: EventOf<"session.step.failed">, ctx: Handler
   const ttftMs = recordTtft(meta, d.sessionID, modelID, providerID, agent, ctx)
 
   recordUsageMetrics(d.sessionID, modelID, providerID, agent, d.tokens, d.cost, ctx)
-  recordGenAiMetrics(d.sessionID, modelID, providerID, agent, d.tokens, durationMs, d.finish ?? "error", ctx)
+  recordGenAiMetrics(d.sessionID, modelID, providerID, agent, d.tokens, durationMs, d.error?.type ?? d.finish ?? "error", ctx)
   const firstStep = countMessage(d.assistantMessageID, d.sessionID, modelID, providerID, agent, ctx)
   accumulateTotals(d.sessionID, allTokens(d.tokens), d.cost ?? 0, firstStep, ctx)
 
@@ -260,6 +281,7 @@ export function handleStepFailed(e: EventOf<"session.step.failed">, ctx: Handler
       agent,
       agentType,
       finish: d.finish,
+      error: d.error,
       durationMs,
       ttftMs,
       ...(d.tokens ? { tokens: d.tokens } : {}),
@@ -285,6 +307,7 @@ export function handleStepFailed(e: EventOf<"session.step.failed">, ctx: Handler
       "gen_ai.provider.name": genAiProviderName(providerID),
       ...signalAttrs(ctx.semconv, { agent, agentType }),
       error,
+      ...errorAttrs(d.error),
       duration_ms: durationMs,
       ...(ttftMs !== undefined
         ? {
@@ -334,8 +357,9 @@ function recordUsageMetrics(
 }
 
 /**
- * Records the official GenAI token-usage and operation-duration histograms. No-ops outside
- * the `gen_ai` flavor, where `opencode.token.usage` remains the token counter.
+ * Records the GenAI inference metrics: one duration histogram per request and one monotonic
+ * counter per token category. No-ops outside the `gen_ai` flavor, where
+ * `opencode.token.usage` remains the token counter.
  */
 function recordGenAiMetrics(
   sessionID: string,
@@ -350,16 +374,24 @@ function recordGenAiMetrics(
   if (ctx.semconv !== "gen_ai") return
   const base = {
     ...ctx.commonAttrs,
-    ...signalAttrs("gen_ai", { sessionID, modelID, providerID, agent }),
-    "gen_ai.operation.name": "chat",
+    ...inferenceMetricAttrs({ sessionID, modelID, providerID, agent }),
   }
-  if (tokens && isMetricEnabled(GEN_AI_METRIC.tokenUsage, ctx)) {
-    const { tokenUsageHistogram } = ctx.instruments
-    tokenUsageHistogram.record(tokens.input + tokens.cache.read + tokens.cache.write, { ...base, "gen_ai.token.type": "input" })
-    tokenUsageHistogram.record(tokens.output + tokens.reasoning, { ...base, "gen_ai.token.type": "output" })
+  if (tokens) {
+    const { inputTokensCounter, outputTokensCounter, cacheReadTokensCounter, cacheWriteTokensCounter, reasoningTokensCounter } = ctx.instruments
+    const add = (name: string, counter: Counter, value: number, modality: string) => {
+      if (value <= 0 || !isMetricEnabled(name, ctx)) return
+      counter.add(value, withTokenModality(base, modality))
+    }
+    add(GEN_AI_METRIC.inputTokens, inputTokensCounter, tokens.input + tokens.cache.read + tokens.cache.write, PROMPT_TOKEN_MODALITY)
+    add(GEN_AI_METRIC.cacheReadInputTokens, cacheReadTokensCounter, tokens.cache.read, PROMPT_TOKEN_MODALITY)
+    add(GEN_AI_METRIC.cacheWriteInputTokens, cacheWriteTokensCounter, tokens.cache.write, PROMPT_TOKEN_MODALITY)
+    add(GEN_AI_METRIC.outputTokens, outputTokensCounter, tokens.output + tokens.reasoning, OUTPUT_TOKEN_MODALITY)
+    if (tokens.reasoning > 0 && isMetricEnabled(GEN_AI_METRIC.reasoningOutputTokens, ctx)) {
+      reasoningTokensCounter.add(tokens.reasoning, base)
+    }
   }
-  if (isMetricEnabled(GEN_AI_METRIC.operationDuration, ctx)) {
-    ctx.instruments.operationDurationHistogram.record(durationMs / 1000, {
+  if (isMetricEnabled(GEN_AI_METRIC.inferenceDuration, ctx)) {
+    ctx.instruments.inferenceDurationHistogram.record(durationMs / 1000, {
       ...base,
       ...(errorType ? { "error.type": errorType } : {}),
     })

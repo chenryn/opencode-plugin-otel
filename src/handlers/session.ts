@@ -1,18 +1,28 @@
 import { SeverityNumber } from "@opentelemetry/api-logs"
 import { SpanStatusCode } from "@opentelemetry/api"
 import type { EventOf, HandlerContext, SessionAgentType, SessionTotals } from "../types.ts"
-import { agentEndAttrs, agentSpanName, agentStartAttrs, signalAttrs } from "../semconv.ts"
+import { agentEndAttrs, agentSpanName, agentStartAttrs, errorAttrs, retryAttrs, signalAttrs } from "../semconv.ts"
 import {
   errorSummary,
   isMetricEnabled,
   isTraceEnabled,
   markSeen,
   modelRef,
+  nextTurnID,
+  normalizeNames,
   resolveSubagentTraceContext,
   sessionSpanContext,
   setBoundedMap,
+  subagentDispatchCallID,
   totalTokens,
+  truncateContent,
+  truncationAttrs,
 } from "../util.ts"
+
+/** Maximum number of skill names retained per prompt. */
+const MAX_PROMPT_SKILLS = 20
+/** Maximum characters retained per skill name. */
+const MAX_SKILL_NAME = 128
 
 export function handlePromptEnqueued(e: EventOf<"session.inbox.enqueued">, ctx: HandlerContext, capturePrompt: boolean) {
   const { sessionID, inboxID, item } = e.data
@@ -22,18 +32,21 @@ export function handlePromptEnqueued(e: EventOf<"session.inbox.enqueued">, ctx: 
   for (const agent of item.payload.agents ?? []) parts.push(agent.name)
   for (const skill of item.payload.skills ?? []) parts.push(skill.name)
   const text = parts.filter(Boolean).join("\n")
+  const skills = normalizeNames(item.payload.skills?.map((skill) => skill.name), MAX_PROMPT_SKILLS, MAX_SKILL_NAME)
   if (item.delivery === "steer" && ctx.tracing.activeExecutions.has(sessionID)) {
     const active = ctx.tracing.activePrompts.get(sessionID)
     setBoundedMap(ctx.tracing.activePrompts, sessionID, {
       text: active?.text ? `${active.text}\n${text}` : text,
       startMs: active?.startMs ?? e.created,
+      ...mergeSkills(active?.skills, skills),
     })
   } else {
     const queue = ctx.tracing.pendingPrompts.get(sessionID) ?? []
-    if (queue.length < 100) queue.push({ text, startMs: e.created })
+    if (queue.length < 100) queue.push({ text, startMs: e.created, ...(skills.length ? { skills } : {}) })
     setBoundedMap(ctx.tracing.pendingPrompts, sessionID, queue)
   }
   const totals = ctx.tracing.sessionTotals.get(sessionID)
+  const prompt = truncateContent(text)
   ctx.emitEvent({
     severityNumber: SeverityNumber.INFO,
     severityText: "INFO",
@@ -45,11 +58,20 @@ export function handlePromptEnqueued(e: EventOf<"session.inbox.enqueued">, ctx: 
       ...signalAttrs(ctx.semconv, { sessionID, ...(totals ? { agent: totals.agent, agentType: totals.agentType } : {}) }),
       "message.id": inboxID,
       prompt_length: text.length,
-      ...(capturePrompt && ctx.captureContent ? { prompt: text } : {}),
+      ...(capturePrompt && ctx.captureContent
+        ? { prompt: prompt.text, ...truncationAttrs("prompt", prompt) }
+        : {}),
+      ...(skills.length ? { "skill.name": skills } : {}),
       delivery: item.delivery,
       ...ctx.commonAttrs,
     },
   }, sessionSpanContext(sessionID, ctx))
+}
+
+/** Merges skill name lists into a deduplicated, bounded list, or reports none. */
+function mergeSkills(current: readonly string[] | undefined, next: readonly string[]): { skills?: string[] } {
+  const merged = normalizeNames([...(current ?? []), ...next], MAX_PROMPT_SKILLS, MAX_SKILL_NAME)
+  return merged.length ? { skills: merged } : {}
 }
 
 function countSession(sessionID: string, isSubagent: boolean, ctx: HandlerContext) {
@@ -165,6 +187,10 @@ export function handleExecutionStarted(e: EventOf<"session.execution.started">, 
   const sessionID = e.data.sessionID
   markSeen(ctx.tracing.activeExecutions, sessionID)
   const totals = ensureSession(sessionID, e.created, ctx)
+  // Allocate the turn before the trace check so a later-enabled step/tool trace still
+  // inherits a stable turn id, even when run spans are disabled.
+  const turnID = nextTurnID(sessionID, ctx)
+  ctx.tracing.sessionRetries.delete(sessionID)
   const queue = ctx.tracing.pendingPrompts.get(sessionID)
   const pendingPrompt = queue?.shift()
   if (queue?.length === 0) ctx.tracing.pendingPrompts.delete(sessionID)
@@ -173,8 +199,10 @@ export function handleExecutionStarted(e: EventOf<"session.execution.started">, 
   if (!isTraceEnabled("session", ctx)) return
 
   const isSubagent = totals?.agentType === "subagent"
-  const parentCtx = isSubagent && totals?.parentID
-    ? resolveSubagentTraceContext(sessionID, totals.parentID, totals.agent, ctx)
+  const parentSessionID = isSubagent ? totals?.parentID : undefined
+  const parentToolCallID = isSubagent ? subagentDispatchCallID(sessionID, ctx) : undefined
+  const parentCtx = isSubagent && parentSessionID
+    ? resolveSubagentTraceContext(sessionID, parentSessionID, totals.agent, ctx)
     : ctx.rootContext()
   const promptText = ctx.captureContent ? pendingPrompt?.text ?? "" : ""
 
@@ -188,6 +216,10 @@ export function handleExecutionStarted(e: EventOf<"session.execution.started">, 
           agent: totals?.agent ?? "unknown",
           agentType: totals?.agentType ?? "primary",
           isSubagent,
+          turnID,
+          ...(parentSessionID ? { parentSessionID } : {}),
+          ...(parentToolCallID ? { parentToolCallID } : {}),
+          ...(pendingPrompt?.skills?.length ? { skillNames: pendingPrompt.skills } : {}),
           ...(promptText ? { promptText } : {}),
         }),
         ...ctx.commonAttrs,
@@ -235,6 +267,7 @@ export function handleExecutionEnded(
     }
     if (outcome.type === "failed") {
       const message = errorSummary(outcome.error)
+      span.setAttributes(errorAttrs(outcome.error))
       span.setStatus({ code: SpanStatusCode.ERROR, message })
       span.setAttribute("error", message)
     } else if (outcome.type === "interrupted") {
@@ -263,6 +296,7 @@ export function handleExecutionEnded(
           agentType: totals?.agentType ?? "unknown",
         }),
         error: message,
+        ...errorAttrs(outcome.error),
         ...ctx.commonAttrs,
       },
     }, sessionSpanContext(sessionID, ctx))
@@ -280,10 +314,24 @@ export function handleSessionStatus(e: EventOf<"session.status">, ctx: HandlerCo
   if (status.type === "idle") finalizeSession(sessionID, ctx)
 }
 
+/**
+ * Records a scheduled API retry on the retry counter and, when the run span exists, on the
+ * span itself. The event is durable and emitted once per attempt, so the counter never adds
+ * a retry to a normal call.
+ */
 export function handleRetryScheduled(e: EventOf<"session.retry.scheduled">, ctx: HandlerContext) {
+  const { sessionID, attempt, error } = e.data
+  const count = (ctx.tracing.sessionRetries.get(sessionID) ?? 0) + 1
+  setBoundedMap(ctx.tracing.sessionRetries, sessionID, count)
   if (isMetricEnabled("retry.count", ctx)) {
-    ctx.instruments.retryCounter.add(1, { ...ctx.commonAttrs, "session.id": e.data.sessionID })
+    ctx.instruments.retryCounter.add(1, {
+      ...ctx.commonAttrs,
+      ...signalAttrs(ctx.semconv, { sessionID }),
+      ...retryAttrs({ attempt, error }),
+    })
   }
+  // A retry can be scheduled before the run span exists (or with run spans disabled).
+  ctx.tracing.runSpans.get(sessionID)?.setAttributes(retryAttrs({ attempt, count, error }))
 }
 
 /** Handles the deprecated `session.idle` event as an idle finalization signal. */
@@ -338,6 +386,7 @@ export function finalizeSession(sessionID: string, ctx: HandlerContext) {
   ctx.tracing.modelContexts.delete(sessionID)
   ctx.tracing.activePrompts.delete(sessionID)
   ctx.tracing.activeExecutions.delete(sessionID)
+  ctx.tracing.sessionRetries.delete(sessionID)
 
   const attrs = { ...ctx.commonAttrs, ...signalAttrs(ctx.semconv, { sessionID }) }
   const durationMs = Date.now() - totals.startMs

@@ -1,7 +1,10 @@
-import { isSpanContextValid, ROOT_CONTEXT, trace, type Context, type SpanContext } from "@opentelemetry/api"
+import { isSpanContextValid, ROOT_CONTEXT, trace, type Attributes, type Context, type SpanContext } from "@opentelemetry/api"
 import { MAX_PENDING, type HandlerContext, type SessionAgentType, type TracingState } from "./types.ts"
 
 const MAX_SEEN_EVENTS = 10_000
+
+/** Maximum number of characters retained in a single content-bearing attribute. */
+export const CONTENT_LIMIT = 20_000
 
 const GEN_AI_PROVIDER_NAMES: Readonly<Record<string, string>> = {
   "amazon-bedrock": "aws.bedrock",
@@ -32,6 +35,72 @@ export type ModelRef = { providerID: string; id: string; variant?: string }
 export function errorSummary(err: StructuredError | undefined): string {
   if (!err) return "unknown"
   return `${err.type}: ${err.message}`
+}
+
+/** A content string together with its truncation state. */
+export type Truncated = {
+  text: string
+  truncated: boolean
+  originalLength: number
+}
+
+/**
+ * Truncates a content value to `limit` Unicode code points and reports whether it was cut
+ * and how long the original was. Cutting by code point keeps surrogate pairs intact.
+ */
+export function truncateContent(value: string | undefined, limit = CONTENT_LIMIT): Truncated {
+  if (!value) return { text: "", truncated: false, originalLength: 0 }
+  const chars = Array.from(value)
+  if (chars.length <= limit) return { text: value, truncated: false, originalLength: chars.length }
+  return { text: chars.slice(0, limit).join(""), truncated: true, originalLength: chars.length }
+}
+
+/**
+ * Returns the truncation marker attributes for a content field. Nothing is written for an
+ * untruncated value, so a backend can distinguish "absent" from "not cut".
+ */
+export function truncationAttrs(field: string, value: Truncated): Attributes {
+  if (!value.truncated) return {}
+  return {
+    [`${field}.truncated`]: true,
+    [`${field}.original_length`]: value.originalLength,
+  }
+}
+
+/**
+ * Normalizes a list of fact names: trims, drops empties, removes duplicates while keeping
+ * the first occurrence, caps each entry and the list length.
+ */
+export function normalizeNames(values: readonly string[] | undefined, maxItems: number, maxLength: number): string[] {
+  if (!values) return []
+  const names: string[] = []
+  for (const value of values) {
+    const name = value.trim().slice(0, maxLength)
+    if (!name || names.includes(name)) continue
+    names.push(name)
+    if (names.length >= maxItems) break
+  }
+  return names
+}
+
+function turnID(sessionID: string, seq: number): string {
+  return `${sessionID}:${seq}`
+}
+
+/**
+ * Allocates the next execution (turn) sequence for a session and returns its id.
+ * Ids are `sessionID:seq` so merging sessions into one backend never collides.
+ */
+export function nextTurnID(sessionID: string, ctx: HandlerContext): string {
+  const seq = (ctx.tracing.sessionTurns.get(sessionID) ?? 0) + 1
+  setBoundedMap(ctx.tracing.sessionTurns, sessionID, seq)
+  return turnID(sessionID, seq)
+}
+
+/** Returns the id of the session's current execution (turn), if one has started. */
+export function currentTurnID(sessionID: string, ctx: HandlerContext): string | undefined {
+  const seq = ctx.tracing.sessionTurns.get(sessionID)
+  return seq ? turnID(sessionID, seq) : undefined
 }
 
 /** Returns the canonical OTel GenAI provider name, preserving unknown provider IDs. */
@@ -141,6 +210,20 @@ export function resolveStepContext(sessionID: string, assistantMessageID: string
   if (span) return trace.setSpan(parent, span)
   const spanContext = ctx.tracing.stepSpanContexts.get(assistantMessageID)
   return spanContext ? trace.setSpanContext(parent, spanContext) : parent
+}
+
+/**
+ * Returns the tool call id that dispatched `sessionID` as a subagent, when the correlation
+ * is known from live progress or a completed dispatch. Must be called before
+ * {@link resolveSubagentTraceContext} consumes the pending correlation.
+ */
+export function subagentDispatchCallID(sessionID: string, ctx: HandlerContext): string | undefined {
+  const exact = ctx.tracing.subagentParents.get(sessionID)?.callID
+  if (exact) return exact
+  for (const [callID, meta] of ctx.tracing.toolMeta) {
+    if (meta.tool === "subagent" && meta.childSessionID === sessionID) return callID
+  }
+  return undefined
 }
 
 /** Resolves a child run under its correlated dispatch tool, falling back to the parent run. */

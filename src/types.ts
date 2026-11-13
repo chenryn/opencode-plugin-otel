@@ -39,12 +39,28 @@ export type PendingPermission = {
   action: string
   resources: string[]
   sessionID: string
+  /** Tool call id reported by `permission.asked.source`, when present. */
+  toolCallID?: string
+  /** Assistant message id that requested the permission, when present. */
+  messageID?: string
 }
 
 /** Prompt text captured on the `prompt` hook and attached to the next run span. */
 export type PendingPrompt = {
   text: string
   startMs: number
+  /** Skill names hit by this prompt, attached to the run span that consumes it. */
+  skills?: string[]
+}
+
+/** Factual tool metadata derived from tool arguments: no content, no judgement. */
+export type ToolFacts = {
+  /** Operation reported for file tools, e.g. `read`, `write`, `edit`, `list`, `glob`, `search`. */
+  operation?: string
+  /** Paths reported for file tools, in argument order. */
+  paths?: string[]
+  /** Command reported for shell tools, verbatim. */
+  command?: string
 }
 
 /** OTel metric instruments created once at plugin startup and shared via `HandlerContext`. */
@@ -63,10 +79,30 @@ export type Instruments = {
   retryCounter: Counter
   subtaskCounter: Counter
   ttftHistogram: Histogram
-  /** `gen_ai.client.token.usage`; recorded only in the `gen_ai` flavor. */
-  tokenUsageHistogram: Histogram
-  /** `gen_ai.client.operation.duration`; recorded only in the `gen_ai` flavor. */
-  operationDurationHistogram: Histogram
+  /** `gen_ai.execute_tool.duration`; recorded only in the `gen_ai` flavor. */
+  executeToolDurationHistogram: Histogram
+  /** `gen_ai.client.inference.duration`; recorded only in the `gen_ai` flavor. */
+  inferenceDurationHistogram: Histogram
+  /** `gen_ai.client.inference.usage.input_tokens`; recorded only in the `gen_ai` flavor. */
+  inputTokensCounter: Counter
+  /** `gen_ai.client.inference.usage.output_tokens`; recorded only in the `gen_ai` flavor. */
+  outputTokensCounter: Counter
+  /** `gen_ai.client.inference.usage.cache_read.input_tokens`; recorded only in the `gen_ai` flavor. */
+  cacheReadTokensCounter: Counter
+  /** `gen_ai.client.inference.usage.cache_write.input_tokens`; recorded only in the `gen_ai` flavor. */
+  cacheWriteTokensCounter: Counter
+  /** `gen_ai.client.inference.usage.reasoning.output_tokens`; recorded only in the `gen_ai` flavor. */
+  reasoningTokensCounter: Counter
+  /** `{prefix}exporter.export.failures`; one increment per failed export batch. */
+  exporterFailureCounter: Counter
+  /** `{prefix}exporter.auth.retry.count`; one increment per header refresh after an auth failure. */
+  exporterAuthRetryCounter: Counter
+  /** `{prefix}event.dispatch.errors`; one increment per failed event dispatch. */
+  eventDispatchErrorCounter: Counter
+  /** `{prefix}flush.failures`; one increment per scheduled flush with a failed provider. */
+  flushFailureCounter: Counter
+  /** `{prefix}flush.duration`; one record per scheduled flush. */
+  flushDurationHistogram: Histogram
 }
 
 /** Session role emitted by opencode: either the primary/root agent or a spawned subagent. */
@@ -103,6 +139,8 @@ export type StepMeta = {
   agentType: SessionAgentType | "unknown"
   modelID: string
   providerID: string
+  /** Turn id of the owning execution, inherited by its tool calls. */
+  turnID?: string
 }
 
 /** Metadata for an in-flight tool call keyed by tool call id. */
@@ -115,6 +153,12 @@ export type ToolMeta = {
   command?: string
   agent?: string
   childSessionID?: string
+  /** Execution sequence inherited from the owning step. */
+  turnID?: string
+  /** Assistant message id of the owning step. */
+  stepID?: string
+  /** Factual tool metadata captured when the call was observed. */
+  toolFacts?: ToolFacts
 }
 
 /** Live LLM request metadata used by the `model.request` trace-propagation hook. */
@@ -178,6 +222,10 @@ export type TracingState = {
   countedMessages: Set<string>
   sessionProjects: Map<string, string>
   sessionIdentity: Map<string, SessionIdentity>
+  /** Last observed execution (turn) sequence per session, used to build `gen_ai.turn.id`. */
+  sessionTurns: Map<string, number>
+  /** Retries observed in the current execution per session, used for `session.retry.count`. */
+  sessionRetries: Map<string, number>
   stepOutputs: Map<string, Map<number, string>>
   pendingPrompts: Map<string, PendingPrompt[]>
   activePrompts: Map<string, PendingPrompt>
@@ -191,7 +239,10 @@ export type TracingState = {
 /** Shared context threaded through every event handler. */
 export type HandlerContext = {
   log: PluginLogger
-  /** Emits a log event; redundant events are dropped in the `gen_ai` flavor. */
+  /**
+   * Emits a log event. Events that duplicate a span are dropped in the `gen_ai` flavor only
+   * when `OPENCODE_EMIT_REDUNDANT_EVENTS` (or the `emitRedundantEvents` option) is disabled.
+   */
   emitEvent: (record: LogRecord, spanContext?: SpanContext) => void
   instruments: Instruments
   commonAttrs: CommonAttrs
@@ -200,6 +251,8 @@ export type HandlerContext = {
   semconv: SemconvFlavor
   /** Whether message/tool content may be serialized into spans and logs. */
   captureContent: boolean
+  /** Whether factual tool metadata (command, file paths) may be emitted. */
+  captureToolFacts: boolean
   tracer: Tracer
   tracePrefix: string
   rootContext: () => Context

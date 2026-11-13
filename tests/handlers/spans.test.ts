@@ -38,6 +38,9 @@ describe("trace nesting", () => {
     const tool = tracer.spans.find((span) => span.name === "opencode.tool.subagent")!
     const child = tracer.spans.find((span) => span.attributes["session.id"] === "child")!
     expect(child.parentSpanContext?.spanId).toBe(tool.spanContext().spanId)
+    expect(tool.attributes["parent_tool_call_id"]).toBe("call_1")
+    expect(child.attributes["parent_session_id"]).toBe("parent")
+    expect(child.attributes["parent_tool_call_id"]).toBe("call_1")
     handleToolSuccess(evt("session.tool.success", { sessionID: "parent", assistantMessageID: "m", id: "call_1", content: [{ type: "text", text: "done" }], metadata: { sessionID: "child" }, executed: false }, 1900), ctx)
     expect(histograms.tool.calls.at(-1)?.value).toBe(400)
     expect(ctx.tracing.consumedSubagentDispatches.has("call_1")).toBe(true)

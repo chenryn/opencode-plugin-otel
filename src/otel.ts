@@ -16,7 +16,15 @@ import { resourceFromAttributes } from "@opentelemetry/resources"
 import { ATTR_SERVICE_NAME } from "@opentelemetry/semantic-conventions"
 import { ATTR_HOST_ARCH } from "@opentelemetry/semantic-conventions/incubating"
 import type { Instruments } from "./types.ts"
+import { GEN_AI_METRIC } from "./semconv.ts"
 import { parseAttributePairs, type MetricsTemporality } from "./config.ts"
+import {
+  createExportHealth,
+  observeExporter,
+  recordAuthRetry,
+  recordExportFailure,
+  type ExportHealth,
+} from "./export-health.ts"
 import {
   createGrpcMetadata,
   DynamicHeaders,
@@ -24,6 +32,7 @@ import {
   RefreshingLogExporter,
   RefreshingMetricExporter,
   RefreshingSpanExporter,
+  type ExportSignal,
   type HeadersMap,
 } from "./headers.ts"
 
@@ -48,14 +57,26 @@ export type OtelProviders = {
   meterProvider: MeterProvider
   loggerProvider: LoggerProvider
   tracerProvider: BasicTracerProvider
+  /** Buffered export/queue health counters drained with each scheduled flush. */
+  health: ExportHealth
 }
 
-export async function forceFlushOtel(providers: OtelProviders) {
-  await Promise.allSettled([
+/** Outcome of a forced flush, used by the export-health counters. */
+export type FlushOutcome = {
+  ok: boolean
+  failed: number
+  durationMs: number
+}
+
+export async function forceFlushOtel(providers: OtelProviders): Promise<FlushOutcome> {
+  const started = Date.now()
+  const results = await Promise.allSettled([
     providers.meterProvider.forceFlush(),
     providers.loggerProvider.forceFlush(),
     providers.tracerProvider.forceFlush(),
   ])
+  const failed = results.filter((result) => result.status === "rejected").length
+  return { ok: failed === 0, failed, durationMs: Date.now() - started }
 }
 
 export function buildHttpSignalUrl(endpoint: string, signal: "traces" | "metrics" | "logs") {
@@ -110,6 +131,11 @@ export async function setupOtel(
   const resource = buildResource(version, resourceAttributes ?? "")
   const staticHeaders = parseOtlpHeaders(otlpHeaders)
   const dynamicHeaders = new DynamicHeaders(staticHeaders, otlpHeadersHelper)
+  const health = createExportHealth()
+  const observer = {
+    failure: (signal: ExportSignal, error: unknown) => recordExportFailure(health, signal, error),
+    authRetry: (signal: ExportSignal) => recordAuthRetry(health, signal),
+  }
   const temporalityPreference = metricTemporalityPreference(metricsTemporality)
   if (otlpHeadersHelper) {
     try {
@@ -134,14 +160,14 @@ export async function setupOtel(
       ? new OTLPHttpTraceExporter({ url: buildHttpSignalUrl(endpoint, "traces"), headers })
       : new OTLPTraceExporter({ url: endpoint, metadata: createGrpcMetadata(headers) }))
   const metricExporter = otlpHeadersHelper
-    ? new RefreshingMetricExporter(makeMetricExporter, dynamicHeaders)
-    : makeMetricExporter(staticHeaders)
+    ? new RefreshingMetricExporter(makeMetricExporter, dynamicHeaders, observer)
+    : observeExporter(makeMetricExporter(staticHeaders), "metrics", health)
   const logExporter = otlpHeadersHelper
-    ? new RefreshingLogExporter(makeLogExporter, dynamicHeaders)
-    : makeLogExporter(staticHeaders)
+    ? new RefreshingLogExporter(makeLogExporter, dynamicHeaders, observer)
+    : observeExporter(makeLogExporter(staticHeaders), "logs", health)
   const traceExporter = otlpHeadersHelper
-    ? new RefreshingSpanExporter(makeTraceExporter, dynamicHeaders)
-    : makeTraceExporter(staticHeaders)
+    ? new RefreshingSpanExporter(makeTraceExporter, dynamicHeaders, observer)
+    : observeExporter(makeTraceExporter(staticHeaders), "traces", health)
 
   const meterProvider = new MeterProvider({
     resource,
@@ -170,7 +196,7 @@ export async function setupOtel(
   })
   trace.setGlobalTracerProvider(tracerProvider)
 
-  return { meterProvider, loggerProvider, tracerProvider }
+  return { meterProvider, loggerProvider, tracerProvider, health }
 }
 
 /** Creates all metric instruments using the global `MeterProvider`. Metric names are prefixed with `prefix`. */
@@ -232,26 +258,66 @@ export function createInstruments(prefix: string, version?: string): Instruments
       unit: "{subtask}",
       description: "Number of sub-agent sessions observed via session.created with a parentID",
     }),
-    ttftHistogram: meter.createHistogram("gen_ai.server.time_to_first_token", {
+    ttftHistogram: meter.createHistogram(GEN_AI_METRIC.timeToFirstToken, {
       unit: "s",
       description: "Time from the model request start to the first streamed output token",
       advice: {
         explicitBucketBoundaries: [0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 40, 60, 120],
       },
     }),
-    tokenUsageHistogram: meter.createHistogram("gen_ai.client.token.usage", {
-      unit: "{token}",
-      description: "Number of input and output tokens used per GenAI request",
+    executeToolDurationHistogram: meter.createHistogram(GEN_AI_METRIC.executeToolDuration, {
+      unit: "s",
+      description: "Duration of a single tool execution",
       advice: {
-        explicitBucketBoundaries: [1, 4, 16, 64, 256, 1024, 4096, 16384, 65536, 262144, 1048576],
+        explicitBucketBoundaries: [0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, 2.56, 5.12, 10.24, 20.48, 40.96, 81.92],
       },
     }),
-    operationDurationHistogram: meter.createHistogram("gen_ai.client.operation.duration", {
+    inferenceDurationHistogram: meter.createHistogram(GEN_AI_METRIC.inferenceDuration, {
       unit: "s",
-      description: "GenAI operation duration",
+      description: "GenAI client inference operation duration",
       advice: {
-        explicitBucketBoundaries: [0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, 2.56, 5.12, 10.24, 20.48, 40.96],
+        explicitBucketBoundaries: [0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, 2.56, 5.12, 10.24, 20.48, 40.96, 81.92],
       },
+    }),
+    inputTokensCounter: meter.createCounter(GEN_AI_METRIC.inputTokens, {
+      unit: "{token}",
+      description: "Input (prompt) tokens used, including cached tokens",
+    }),
+    outputTokensCounter: meter.createCounter(GEN_AI_METRIC.outputTokens, {
+      unit: "{token}",
+      description: "Output (completion) tokens used, including reasoning tokens",
+    }),
+    cacheReadTokensCounter: meter.createCounter(GEN_AI_METRIC.cacheReadInputTokens, {
+      unit: "{token}",
+      description: "Input tokens served from the provider prompt cache",
+    }),
+    cacheWriteTokensCounter: meter.createCounter(GEN_AI_METRIC.cacheWriteInputTokens, {
+      unit: "{token}",
+      description: "Input tokens written to the provider prompt cache",
+    }),
+    reasoningTokensCounter: meter.createCounter(GEN_AI_METRIC.reasoningOutputTokens, {
+      unit: "{token}",
+      description: "Output tokens spent on reasoning, a subset of the output token counter",
+    }),
+    exporterFailureCounter: meter.createCounter(`${prefix}exporter.export.failures`, {
+      unit: "{failure}",
+      description: "Failed OTLP export batches by signal and error type",
+    }),
+    exporterAuthRetryCounter: meter.createCounter(`${prefix}exporter.auth.retry.count`, {
+      unit: "{retry}",
+      description: "OTLP header refreshes triggered by an authentication failure, by signal",
+    }),
+    eventDispatchErrorCounter: meter.createCounter(`${prefix}event.dispatch.errors`, {
+      unit: "{error}",
+      description: "OpenCode event dispatch failures by event type",
+    }),
+    flushFailureCounter: meter.createCounter(`${prefix}flush.failures`, {
+      unit: "{failure}",
+      description: "Scheduled telemetry flushes where at least one provider failed",
+    }),
+    flushDurationHistogram: meter.createHistogram(`${prefix}flush.duration`, {
+      unit: "ms",
+      description: "Duration of a scheduled telemetry flush in milliseconds",
     }),
   }
 }

@@ -129,3 +129,55 @@ describe("RefreshingSpanExporter", () => {
     expect(shutdowns).toEqual([["Authorization"]])
   })
 })
+
+describe("export observer", () => {
+  test("reports a failed batch and the auth retry", async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "otel-headers-"))
+    const helper = join(tempDir, "helper.sh")
+    await Bun.write(helper, "#!/bin/sh\nprintf '%s' '{\"Authorization\":\"Bearer dynamic\"}'\n")
+    await Bun.spawn(["chmod", "+x", helper]).exited
+
+    const dynamicHeaders = new DynamicHeaders({ Authorization: "Bearer static" }, helper)
+    const shutdowns: string[][] = []
+    const results = [
+      { code: ExportResultCode.FAILED, error: Object.assign(new Error("Unauthorized"), { statusCode: 401 }) },
+      { code: ExportResultCode.SUCCESS },
+    ]
+    const failures: string[] = []
+    const retries: string[] = []
+    const exporter = new RefreshingSpanExporter(
+      (headers) => new FakeSpanExporter(headers, results, shutdowns),
+      dynamicHeaders,
+      { failure: (signal) => failures.push(signal), authRetry: (signal) => retries.push(signal) },
+    )
+
+    const result = await new Promise<ExportResult>((resolve) => exporter.export([], resolve))
+    expect(result.code).toBe(ExportResultCode.SUCCESS)
+    expect(failures).toEqual(["traces"])
+    expect(retries).toEqual(["traces"])
+  })
+
+  test("reports a retried export that fails again", async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "otel-headers-"))
+    const helper = join(tempDir, "helper.sh")
+    await Bun.write(helper, "#!/bin/sh\nprintf '%s' '{\"Authorization\":\"Bearer dynamic\"}'\n")
+    await Bun.spawn(["chmod", "+x", helper]).exited
+
+    const dynamicHeaders = new DynamicHeaders({ Authorization: "Bearer static" }, helper)
+    const shutdowns: string[][] = []
+    const results = [
+      { code: ExportResultCode.FAILED, error: Object.assign(new Error("Unauthorized"), { statusCode: 401 }) },
+      { code: ExportResultCode.FAILED, error: new Error("boom") },
+    ]
+    const failures: string[] = []
+    const exporter = new RefreshingSpanExporter(
+      (headers) => new FakeSpanExporter(headers, results, shutdowns),
+      dynamicHeaders,
+      { failure: (signal) => failures.push(signal) },
+    )
+
+    const result = await new Promise<ExportResult>((resolve) => exporter.export([], resolve))
+    expect(result.code).toBe(ExportResultCode.FAILED)
+    expect(failures).toEqual(["traces", "traces"])
+  })
+})

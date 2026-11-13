@@ -156,6 +156,8 @@ export function makeTracingState(): TracingState {
     countedMessages: new Set(),
     sessionProjects: new Map(),
     sessionIdentity: new Map(),
+    sessionTurns: new Map(),
+    sessionRetries: new Map(),
     stepOutputs: new Map(),
     pendingPrompts: new Map(),
     activePrompts: new Map(),
@@ -184,6 +186,15 @@ export type MockContext = {
     modelUsage: SpyCounter
     retry: SpyCounter
     subtask: SpyCounter
+    exporterFailure: SpyCounter
+    exporterAuthRetry: SpyCounter
+    eventDispatchError: SpyCounter
+    flushFailure: SpyCounter
+    inputTokens: SpyCounter
+    outputTokens: SpyCounter
+    cacheReadTokens: SpyCounter
+    cacheWriteTokens: SpyCounter
+    reasoningTokens: SpyCounter
   }
   histograms: {
     tool: SpyHistogram
@@ -191,8 +202,9 @@ export type MockContext = {
     sessionToken: SpyHistogram
     sessionCost: SpyHistogram
     ttft: SpyHistogram
-    tokenUsage: SpyHistogram
-    operationDuration: SpyHistogram
+    executeToolDuration: SpyHistogram
+    inferenceDuration: SpyHistogram
+    flushDuration: SpyHistogram
   }
   logger: SpyLogger
   pluginLog: SpyPluginLog
@@ -207,6 +219,8 @@ export function makeCtx(
   extraCommonAttrs: Record<string, string> = {},
   semconv: SemconvFlavor = "openinference",
   captureContent = true,
+  emitRedundantEvents = true,
+  captureToolFacts = true,
 ): MockContext {
   const session = makeCounter()
   const token = makeCounter()
@@ -222,8 +236,18 @@ export function makeCtx(
   const sessionTokenHistogram = makeHistogram()
   const sessionCostHistogram = makeHistogram()
   const ttftHistogram = makeHistogram()
-  const tokenUsageHistogram = makeHistogram()
-  const operationDurationHistogram = makeHistogram()
+  const executeToolDurationHistogram = makeHistogram()
+  const inferenceDurationHistogram = makeHistogram()
+  const inputTokensCounter = makeCounter()
+  const outputTokensCounter = makeCounter()
+  const cacheReadTokensCounter = makeCounter()
+  const cacheWriteTokensCounter = makeCounter()
+  const reasoningTokensCounter = makeCounter()
+  const exporterFailure = makeCounter()
+  const exporterAuthRetry = makeCounter()
+  const eventDispatchError = makeCounter()
+  const flushFailure = makeCounter()
+  const flushDuration = makeHistogram()
   const logger = makeLogger()
   const pluginLog = makePluginLog()
   const tracer = makeTracer()
@@ -243,15 +267,25 @@ export function makeCtx(
     retryCounter: retry as unknown as Counter,
     subtaskCounter: subtask as unknown as Counter,
     ttftHistogram: ttftHistogram as unknown as Histogram,
-    tokenUsageHistogram: tokenUsageHistogram as unknown as Histogram,
-    operationDurationHistogram: operationDurationHistogram as unknown as Histogram,
+    executeToolDurationHistogram: executeToolDurationHistogram as unknown as Histogram,
+    inferenceDurationHistogram: inferenceDurationHistogram as unknown as Histogram,
+    inputTokensCounter: inputTokensCounter as unknown as Counter,
+    outputTokensCounter: outputTokensCounter as unknown as Counter,
+    cacheReadTokensCounter: cacheReadTokensCounter as unknown as Counter,
+    cacheWriteTokensCounter: cacheWriteTokensCounter as unknown as Counter,
+    reasoningTokensCounter: reasoningTokensCounter as unknown as Counter,
+    exporterFailureCounter: exporterFailure as unknown as Counter,
+    exporterAuthRetryCounter: exporterAuthRetry as unknown as Counter,
+    eventDispatchErrorCounter: eventDispatchError as unknown as Counter,
+    flushFailureCounter: flushFailure as unknown as Counter,
+    flushDurationHistogram: flushDuration as unknown as Histogram,
   }
 
   const ctx: HandlerContext = {
     log: pluginLog.fn,
     emitEvent: (record, spanContext) => {
       if (!logsEnabled) return
-      if (isEventSuppressed(semconv, String(record.body))) return
+      if (!emitRedundantEvents && isEventSuppressed(semconv, String(record.body))) return
       const context = eventContext(spanContext)
       logger.emit(context ? { ...record, context } : record)
     },
@@ -261,6 +295,7 @@ export function makeCtx(
     disabledTraces: new Set(disabledTraces),
     semconv,
     captureContent,
+    captureToolFacts,
     tracer: tracer as unknown as Tracer,
     tracePrefix: "opencode.",
     rootContext: () => ROOT_CONTEXT,
@@ -270,15 +305,22 @@ export function makeCtx(
 
   return {
     ctx,
-    counters: { session, token, cost, commit, cache, message, modelUsage, retry, subtask },
+    counters: {
+      session, token, cost, commit, cache, message, modelUsage, retry, subtask,
+      exporterFailure, exporterAuthRetry, eventDispatchError, flushFailure,
+      inputTokens: inputTokensCounter, outputTokens: outputTokensCounter,
+      cacheReadTokens: cacheReadTokensCounter, cacheWriteTokens: cacheWriteTokensCounter,
+      reasoningTokens: reasoningTokensCounter,
+    },
     histograms: {
       tool: toolHistogram,
       sessionDuration: sessionDurationHistogram,
       sessionToken: sessionTokenHistogram,
       sessionCost: sessionCostHistogram,
       ttft: ttftHistogram,
-      tokenUsage: tokenUsageHistogram,
-      operationDuration: operationDurationHistogram,
+      executeToolDuration: executeToolDurationHistogram,
+      inferenceDuration: inferenceDurationHistogram,
+      flushDuration,
     },
     logger,
     pluginLog,

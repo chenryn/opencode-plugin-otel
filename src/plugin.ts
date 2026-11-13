@@ -6,6 +6,7 @@ import { probeEndpoint } from "./probe.ts"
 import { forceFlushOtel } from "./otel.ts"
 import { remoteParentContext } from "./trace-context.ts"
 import { acquireSharedOtel, acquireTracingState, createFlushScheduler, flushSharedOtel, releaseSharedOtel } from "./state.ts"
+import { drainExportHealth, recordDispatchError, recordFlush } from "./export-health.ts"
 import { LEVELS, type HandlerContext, type Level, type OpenCodeContext, type OpenCodeEvent } from "./types.ts"
 import { consumeEvents, contextForSession, eventContext, setBoundedMap } from "./util.ts"
 import {
@@ -72,6 +73,7 @@ export async function setup(ctx: OpenCodeContext): Promise<() => Promise<void>> 
     logsInterval: config.logsInterval,
     metricPrefix: config.metricPrefix,
     semconv: config.semconv,
+    emitRedundantEvents: config.emitRedundantEvents,
     headersHelperSet: !!config.otlpHeadersHelper,
   })
 
@@ -84,7 +86,12 @@ export async function setup(ctx: OpenCodeContext): Promise<() => Promise<void>> 
 
   const shared = await acquireSharedOtel(config, PLUGIN_VERSION)
   const tracing = acquireTracingState()
-  const flush = createFlushScheduler(() => forceFlushOtel(shared.providers))
+  const commonAttrs = parseAttributePairs(config.spanAttributes)
+  const flush = createFlushScheduler(async () => {
+    const outcome = await forceFlushOtel(shared.providers)
+    recordFlush(shared.providers.health, outcome.ok, outcome.durationMs)
+    drainExportHealth(shared.providers.health, shared.instruments, config.disabledMetrics, commonAttrs)
+  })
   await log("info", "OTel SDK initialized")
 
   const g = globalThis as Record<string, unknown>
@@ -97,7 +104,7 @@ export async function setup(ctx: OpenCodeContext): Promise<() => Promise<void>> 
 
   const emitEvent: HandlerContext["emitEvent"] = (record, spanContext) => {
     if (!config.logsEnabled) return
-    if (isEventSuppressed(config.semconv, String(record.body))) return
+    if (!config.emitRedundantEvents && isEventSuppressed(config.semconv, String(record.body))) return
     const context = eventContext(spanContext)
     shared.logger.emit(context ? { ...record, context } : record)
   }
@@ -111,11 +118,12 @@ export async function setup(ctx: OpenCodeContext): Promise<() => Promise<void>> 
     log,
     emitEvent,
     instruments: shared.instruments,
-    commonAttrs: parseAttributePairs(config.spanAttributes),
+    commonAttrs,
     disabledMetrics: config.disabledMetrics,
     disabledTraces: config.disabledTraces,
     semconv: config.semconv,
     captureContent: config.semconv === "gen_ai" ? config.captureModelContext : true,
+    captureToolFacts: config.captureToolFacts,
     tracer: shared.tracer,
     tracePrefix: config.metricPrefix,
     rootContext: remoteContext ? () => remoteContext : () => ROOT_CONTEXT,
@@ -126,6 +134,9 @@ export async function setup(ctx: OpenCodeContext): Promise<() => Promise<void>> 
   if (config.disabledMetrics.size > 0) await log("info", "metrics disabled", { disabled: [...config.disabledMetrics] })
   if (config.disabledTraces.size > 0) await log("info", "traces disabled", { disabled: [...config.disabledTraces] })
   if (!config.logsEnabled) await log("info", "OTLP log events disabled")
+  if (!config.emitRedundantEvents) {
+    await log("info", "log events that duplicate a span are suppressed", { semconv: config.semconv })
+  }
   if (config.capturePromptInLogs) {
     await log("info", "prompt-in-logs capture enabled - full prompt text emitted in the `prompt` attribute of user_prompt log events")
   }
@@ -261,6 +272,7 @@ export async function setup(ctx: OpenCodeContext): Promise<() => Promise<void>> 
     tracing,
     dispatch,
     async (event, err) => {
+      recordDispatchError(shared.providers.health, event.type)
       await log("error", "otel: failed to handle event", {
         type: event.type,
         error: err instanceof Error ? err.message : String(err),

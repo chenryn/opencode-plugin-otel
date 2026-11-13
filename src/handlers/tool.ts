@@ -1,8 +1,9 @@
 import { SeverityNumber } from "@opentelemetry/api-logs"
 import { SpanKind, SpanStatusCode } from "@opentelemetry/api"
-import type { EventOf, HandlerContext } from "../types.ts"
-import { signalAttrs, toolCallAttrs, toolEndAttrs, toolSpanName, toolStartAttrs } from "../semconv.ts"
+import type { EventOf, HandlerContext, ToolFacts, ToolMeta } from "../types.ts"
+import { GEN_AI_METRIC, errorAttrs, signalAttrs, toolCallAttrs, toolDurationAttrs, toolEndAttrs, toolFactsAttrs, toolSpanName, toolStartAttrs } from "../semconv.ts"
 import {
+  currentTurnID,
   errorSummary,
   getSessionAgentMeta,
   isMetricEnabled,
@@ -10,10 +11,87 @@ import {
   recordFirstToken,
   resolveStepContext,
   setBoundedMap,
+  type StructuredError,
 } from "../util.ts"
 
 const GIT_COMMIT_RE = /\bgit\s+commit(?![-\w])/
 const SHELL_TOOL_RE = /(^|\.)(bash|shell)$/i
+
+type FileToolSpec = {
+  operation: string
+  /** Argument keys holding a single path, tried in order. */
+  keys: string[]
+  /** Argument keys holding a list of edits/patches, each with its own path. */
+  many?: string[]
+}
+
+const FILE_TOOL_PATH_KEYS = ["path", "filePath", "file_path"]
+
+const FILE_TOOL_SPEC: Readonly<Record<string, FileToolSpec>> = {
+  read: { operation: "read", keys: FILE_TOOL_PATH_KEYS },
+  view: { operation: "read", keys: FILE_TOOL_PATH_KEYS },
+  write: { operation: "write", keys: FILE_TOOL_PATH_KEYS },
+  create: { operation: "write", keys: FILE_TOOL_PATH_KEYS },
+  edit: { operation: "edit", keys: FILE_TOOL_PATH_KEYS },
+  multiedit: { operation: "edit", keys: FILE_TOOL_PATH_KEYS, many: ["edits", "files"] },
+  patch: { operation: "edit", keys: FILE_TOOL_PATH_KEYS, many: ["patches", "edits", "files"] },
+  apply_patch: { operation: "edit", keys: [], many: ["patches", "files"] },
+  list: { operation: "list", keys: FILE_TOOL_PATH_KEYS },
+  ls: { operation: "list", keys: FILE_TOOL_PATH_KEYS },
+  glob: { operation: "glob", keys: [] },
+  grep: { operation: "search", keys: FILE_TOOL_PATH_KEYS },
+  search: { operation: "search", keys: FILE_TOOL_PATH_KEYS },
+}
+
+/**
+ * Derives factual metadata from tool arguments: the verbatim shell command, or the operation
+ * and paths of a file tool. Returns `undefined` when the tool carries neither, so no empty
+ * attribute is ever written.
+ */
+export function toolFacts(tool: string, input: Record<string, unknown>): ToolFacts | undefined {
+  const facts: ToolFacts = {}
+  const name = tool.toLowerCase().split(".").at(-1) ?? tool.toLowerCase()
+  const spec = FILE_TOOL_SPEC[name]
+  if (spec) {
+    facts.operation = spec.operation
+    const paths = collectPaths(input, spec)
+    if (paths.length) facts.paths = paths
+  }
+  if (SHELL_TOOL_RE.test(tool) && typeof input["command"] === "string" && input["command"]) {
+    facts.command = input["command"]
+  }
+  return facts.operation || facts.command ? facts : undefined
+}
+
+function collectPaths(input: Record<string, unknown>, spec: FileToolSpec): string[] {
+  const paths: string[] = []
+  for (const key of spec.keys) {
+    const value = input[key]
+    if (typeof value === "string" && value) {
+      paths.push(value)
+      break
+    }
+  }
+  for (const key of spec.many ?? []) {
+    const list = input[key]
+    if (!Array.isArray(list)) continue
+    for (const entry of list) {
+      if (typeof entry === "string") {
+        if (entry) paths.push(entry)
+        continue
+      }
+      if (!entry || typeof entry !== "object") continue
+      for (const pathKey of FILE_TOOL_PATH_KEYS) {
+        const value = (entry as Record<string, unknown>)[pathKey]
+        if (typeof value === "string" && value) {
+          paths.push(value)
+          break
+        }
+      }
+    }
+  }
+  return [...new Set(paths)]
+}
 
 type ToolContent = { type: "text"; text: string } | { type: "file"; uri: string; mime: string; name?: string }
 
@@ -21,9 +99,12 @@ type ToolContent = { type: "text"; text: string } | { type: "file"; uri: string;
 export function handleToolInputStarted(e: EventOf<"session.tool.input.started">, ctx: HandlerContext) {
   const d = e.data
   recordFirstToken(d.assistantMessageID, e.created, ctx)
+  const turnID = ctx.tracing.stepMeta.get(d.assistantMessageID)?.turnID ?? currentTurnID(d.sessionID, ctx)
   setBoundedMap(ctx.tracing.toolMeta, d.id, {
     sessionID: d.sessionID,
     assistantMessageID: d.assistantMessageID,
+    stepID: d.assistantMessageID,
+    ...(turnID ? { turnID } : {}),
     tool: d.name,
     startMs: e.created,
   })
@@ -32,15 +113,24 @@ export function handleToolInputStarted(e: EventOf<"session.tool.input.started">,
 /** Starts timing and tracing an observed tool call, and retains the command for commit detection. */
 export function handleToolCalled(e: EventOf<"session.tool.called">, ctx: HandlerContext) {
   const d = e.data
-  const meta = ctx.tracing.toolMeta.get(d.id)
-  if (!meta) return
+  const turnID = ctx.tracing.stepMeta.get(d.assistantMessageID)?.turnID ?? currentTurnID(d.sessionID, ctx)
+  const meta: ToolMeta = ctx.tracing.toolMeta.get(d.id) ?? {
+    sessionID: d.sessionID,
+    assistantMessageID: d.assistantMessageID,
+    stepID: d.assistantMessageID,
+    ...(turnID ? { turnID } : {}),
+    tool: "unknown",
+    startMs: e.created,
+  }
   const isSubagent = meta.tool === "subagent"
+  const facts = ctx.captureToolFacts ? toolFacts(meta.tool, d.input) : undefined
   setBoundedMap(ctx.tracing.toolMeta, d.id, {
     ...meta,
     startMs: e.created,
     executionStarted: true,
     ...(isSubagent && typeof d.input["agent"] === "string" ? { agent: d.input["agent"] } : {}),
     ...(typeof d.input["command"] === "string" ? { command: d.input["command"] } : {}),
+    ...(facts ? { toolFacts: facts } : {}),
   })
 
   if (!isTraceEnabled("tool", ctx)) return
@@ -52,7 +142,13 @@ export function handleToolCalled(e: EventOf<"session.tool.called">, ctx: Handler
         startTime: e.created,
         kind: SpanKind.INTERNAL,
         attributes: {
-          ...toolStartAttrs(ctx.semconv, { sessionID: d.sessionID, tool: meta.tool, callID: d.id }),
+          ...toolStartAttrs(ctx.semconv, {
+            sessionID: d.sessionID,
+            tool: meta.tool,
+            callID: d.id,
+            ...(meta.turnID ? { turnID: meta.turnID } : {}),
+            ...(meta.stepID ? { stepID: meta.stepID } : {}),
+          }),
           ...ctx.commonAttrs,
         },
       },
@@ -68,6 +164,7 @@ export function handleToolCalled(e: EventOf<"session.tool.called">, ctx: Handler
     agentType,
     inputJson: ctx.captureContent ? safeJson(d.input) : undefined,
     providerExecuted: isProviderExecuted(d),
+    ...(facts ? { facts } : {}),
   }))
 }
 
@@ -99,6 +196,9 @@ function startSubagentSpan(callID: string, ctx: HandlerContext) {
           agent: agentName,
           agentType,
           subagent: meta.agent ?? "unknown",
+          parentToolCallID: callID,
+          ...(meta.turnID ? { turnID: meta.turnID } : {}),
+          ...(meta.stepID ? { stepID: meta.stepID } : {}),
         }),
         ...ctx.commonAttrs,
       },
@@ -135,7 +235,7 @@ export function handleToolSuccess(e: EventOf<"session.tool.success">, ctx: Handl
 export function handleToolFailed(e: EventOf<"session.tool.failed">, ctx: HandlerContext) {
   linkSubagent(e.data.id, e.data.metadata?.["sessionID"], ctx)
   const output = contentText(e.data.content)
-  finishTool(e.data.id, e.data.sessionID, e.created, false, output, errorSummary(e.data.error), ctx)
+  finishTool(e.data.id, e.data.sessionID, e.created, false, output, e.data.error, ctx)
 }
 
 function finishTool(
@@ -144,7 +244,7 @@ function finishTool(
   endMs: number,
   success: boolean,
   output: string,
-  error: string | undefined,
+  error: StructuredError | undefined,
   ctx: HandlerContext,
 ) {
   const meta = ctx.tracing.toolMeta.get(callID)
@@ -175,7 +275,14 @@ function finishTool(
     }, spanContext)
   }
 
-  if (observedExecution && isMetricEnabled("tool.duration", ctx)) {
+  if (observedExecution && ctx.semconv === "gen_ai") {
+    if (isMetricEnabled(GEN_AI_METRIC.executeToolDuration, ctx)) {
+      ctx.instruments.executeToolDurationHistogram.record(durationMs / 1000, {
+        ...ctx.commonAttrs,
+        ...toolDurationAttrs({ sessionID, tool, agent: agentName, agentType, success, errorType: error?.type }),
+      })
+    }
+  } else if (observedExecution && isMetricEnabled("tool.duration", ctx)) {
     ctx.instruments.toolDurationHistogram.record(durationMs, {
       ...ctx.commonAttrs,
       ...signalAttrs(ctx.semconv, { sessionID, tool }),
@@ -191,12 +298,12 @@ function finishTool(
       success,
       sizeBytes,
       ...(output && ctx.captureContent ? { output } : {}),
-      ...(success ? {} : { error: error ?? "unknown" }),
+      ...(success ? {} : { error }),
     }))
     if (success) {
       span.setStatus({ code: SpanStatusCode.OK })
     } else {
-      span.setStatus({ code: SpanStatusCode.ERROR, message: error ?? "unknown" })
+      span.setStatus({ code: SpanStatusCode.ERROR, message: errorSummary(error) })
     }
     span.end(endMs)
   }
@@ -214,7 +321,8 @@ function finishTool(
       ...signalAttrs(ctx.semconv, { sessionID, agent: agentName, agentType, tool }),
       success,
       duration_ms: durationMs,
-      ...(success ? { tool_result_size_bytes: sizeBytes } : { error: error ?? "unknown" }),
+      ...toolFactsAttrs(meta?.toolFacts),
+      ...(success ? { tool_result_size_bytes: sizeBytes } : { error: errorSummary(error), ...errorAttrs(error) }),
       ...ctx.commonAttrs,
     },
   }, spanContext)

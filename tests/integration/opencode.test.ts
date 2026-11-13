@@ -79,6 +79,12 @@ for (const disabled of [false, true]) {
         expect(parent["name"]).toBe("opencode.llm")
         expect(tool!["traceId"]).toBe(parent["traceId"])
         expect(attributes(tool!)["output.value"]).toContain("integration-fixture-contents")
+        expect(attributes(tool!)["file.operation"]).toBe("read")
+        expect(String(attributes(tool!)["file.path"])).toEndWith("fixture.txt")
+        const logs = signalRecords(scenario.received["logs"]!, "Logs")
+        const result = logs.find(record => attributes(record)["event.name"] === "tool_result")!
+        expect(attributes(result)["file.operation"]).toBe("read")
+        expect(String(attributes(result)["file.path"])).toEndWith("fixture.txt")
       })
     }
 
@@ -99,10 +105,12 @@ for (const disabled of [false, true]) {
 describe("GenAI semantic conventions", () => {
   let quiet: Awaited<ReturnType<typeof runScenario>>
   let verbose: Awaited<ReturnType<typeof runScenario>>
+  let suppressed: Awaited<ReturnType<typeof runScenario>>
   beforeAll(async () => {
     quiet = await runScenario("text", { semconv: "gen_ai" })
     verbose = await runScenario("text", { semconv: "gen_ai", captureModelContext: true })
-  }, 90_000)
+    suppressed = await runScenario("text", { semconv: "gen_ai", emitRedundantEvents: false })
+  }, 135_000)
 
   test("replaces every OpenInference attribute with its GenAI equivalent", () => {
     const spans = signalRecords(quiet.received["traces"]!, "Spans")
@@ -146,28 +154,31 @@ describe("GenAI semantic conventions", () => {
     expect(input.map((message: { role: string }) => message["role"])).toContain("user")
   })
 
-  test("records the official GenAI histograms instead of the OpenInference counters", () => {
+  test("records the GenAI inference metrics instead of the OpenInference counters", () => {
     const metrics = signalRecords(quiet.received["metrics"]!, "Metrics")
     expect(metricPoints(metrics, "opencode.token.usage", "sum")).toHaveLength(0)
 
-    const usage = metricPoints(metrics, "gen_ai.client.token.usage", "histogram")
-    const typed = (type: string) => usage.filter(point => attributes(point)["gen_ai.token.type"] === type).at(-1)!
-    expect(Number(typed("input")["sum"])).toBe(20)
-    expect(Number(typed("output")["sum"])).toBe(5)
-    expect(attributes(typed("input"))["gen_ai.request.model"]).toBe("scripted")
-    expect(attributes(typed("input"))["gen_ai.conversation.id"]).toBe(quiet.result["sessionID"])
+    const input = metricPoints(metrics, "gen_ai.client.inference.usage.input_tokens", "sum").at(-1)!
+    expect(Number(input["asDouble"] ?? input["asInt"])).toBe(20)
+    expect(attributes(input)["gen_ai.token.modality"]).toBe("unknown")
+    expect(attributes(input)["gen_ai.request.model"]).toBe("scripted")
+    expect(attributes(input)["gen_ai.conversation.id"]).toBe(quiet.result["sessionID"])
 
-    const duration = metricPoints(metrics, "gen_ai.client.operation.duration", "histogram").at(-1)!
+    const output = metricPoints(metrics, "gen_ai.client.inference.usage.output_tokens", "sum").at(-1)!
+    expect(Number(output["asDouble"] ?? output["asInt"])).toBe(5)
+    expect(attributes(output)["gen_ai.token.modality"]).toBe("text")
+
+    const duration = metricPoints(metrics, "gen_ai.client.inference.duration", "histogram").at(-1)!
     expect(Number(duration["count"])).toBe(1)
     expect(attributes(duration)["gen_ai.operation.name"]).toBe("chat")
     expect(attributes(duration)["error.type"]).toBeUndefined()
   })
 
-  test("drops the log events that duplicate a span", () => {
+  test("emits the log events that duplicate a span by default", () => {
     const names = signalRecords(quiet.received["logs"]!, "Logs").map(log => String(attributes(log)["event.name"]))
-    for (const redundant of ["api_request", "api_error", "tool_result", "session.created"]) {
-      expect(names).not.toContain(redundant)
-    }
+    // `session.created` is absent because opencode does not replay it for a session that
+    // existed before the plugin subscribed; the step-level duplicate proves the default.
+    expect(names).toContain("api_request")
     expect(names).toContain("user_prompt")
     expect(names).toContain("session.idle")
     const prompt = signalRecords(quiet.received["logs"]!, "Logs")
@@ -175,6 +186,15 @@ describe("GenAI semantic conventions", () => {
     expect(attributes(prompt)["gen_ai.conversation.id"]).toBe(quiet.result["sessionID"])
     expect(attributes(prompt)["agent"]).toBeUndefined()
     expect(attributes(prompt)["prompt"]).toBeUndefined()
+  })
+
+  test("suppresses the redundant log events when the switch is off", () => {
+    const names = signalRecords(suppressed.received["logs"]!, "Logs").map(log => String(attributes(log)["event.name"]))
+    for (const redundant of ["api_request", "api_error", "tool_result", "session.created"]) {
+      expect(names).not.toContain(redundant)
+    }
+    expect(names).toContain("user_prompt")
+    expect(names).toContain("session.idle")
   })
 
   test("keeps the prompt text on the surviving log event when content capture is on", () => {

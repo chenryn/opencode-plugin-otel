@@ -87,6 +87,8 @@ describe("handleStepFailed", () => {
     expect(llm.attributes["llm.cost.total"]).toBe(0.1)
     expect(logger.records.at(-1)!.body).toBe("api_error")
     expect(logger.records.at(-1)!.attributes?.["error"]).toBe("ProviderError: boom")
+    expect(logger.records.at(-1)!.attributes?.["error.type"]).toBe("ProviderError")
+    expect(logger.records.at(-1)!.attributes?.["error.message"]).toBe("boom")
     expect(recordSpanContext(logger.records.at(-1)!)).toEqual(llm.spanContext())
     expect(counters.message.calls).toHaveLength(1)
     expect(counters.modelUsage.calls).toHaveLength(1)
@@ -110,5 +112,34 @@ describe("API log durations", () => {
     expect(logger.records.find((record) => record.body === "api_request")?.attributes?.["duration_ms"]).toBe(500)
     expect(logger.records.find((record) => record.body === "api_error")?.attributes?.["duration_ms"]).toBe(900)
     expect(tracer.spans.some((span) => span.name === "opencode.llm")).toBe(false)
+  })
+})
+
+describe("assistant output truncation", () => {
+  test("marks a truncated output and keeps the original length", () => {
+    const { ctx, tracer } = makeCtx()
+    handleStepStarted(evt("session.step.started", {
+      sessionID: "ses_1",
+      assistantMessageID: "msg_1",
+      agent: "build",
+      model: { providerID: "anthropic", id: "claude" },
+    }), ctx)
+    handleTextEnded(evt("session.text.ended", {
+      sessionID: "ses_1",
+      assistantMessageID: "msg_1",
+      ordinal: 0,
+      text: "x".repeat(20_001),
+    }), ctx)
+    handleStepEnded(evt("session.step.ended", {
+      sessionID: "ses_1",
+      assistantMessageID: "msg_1",
+      tokens: tokens(),
+      cost: 0.01,
+      finish: "stop",
+    }), ctx)
+    const span = tracer.spans.find((s) => s.name === "opencode.llm")!
+    expect(span.attributes["content.output.truncated"]).toBe(true)
+    expect(span.attributes["content.output.original_length"]).toBe(20_001)
+    expect(String(span.attributes["output.value"]).length).toBe(20_000)
   })
 })
