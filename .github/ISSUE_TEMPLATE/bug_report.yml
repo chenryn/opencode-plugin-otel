@@ -44,7 +44,7 @@ body:
     id: version
     attributes:
       label: Plugin version
-      description: What version of @devtheops/opencode-plugin-otel are you using?
+      description: What version of @chenryn/opencode-plugin-otel are you using?
       placeholder: "0.4.1"
     validations:
       required: true

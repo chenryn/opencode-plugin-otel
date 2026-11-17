@@ -319,5 +319,13 @@ export function createInstruments(prefix: string, version?: string): Instruments
       unit: "ms",
       description: "Duration of a scheduled telemetry flush in milliseconds",
     }),
+    guardDecisionsCounter: meter.createCounter(`${prefix}guard.decisions`, {
+      unit: "{decision}",
+      description: "Runtime guard permission.evaluate decisions (allowed/denied/would_denied/review/warned/passthrough/degraded)",
+    }),
+    guardToolActionsCounter: meter.createCounter(`${prefix}guard.tool.actions`, {
+      unit: "{action}",
+      description: "Runtime guard tool before/after actions (staged, allowlist_denied, redacted, tool_error)",
+    }),
   }
 }

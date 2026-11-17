@@ -6,7 +6,7 @@ import { setup } from "./plugin.ts"
  * discovers it via its `id` and `setup` function. Requires OpenCode `>=2`.
  */
 const plugin = {
-  id: "devtheops.otel",
+  id: "chenryn.otel",
   setup,
 } satisfies Plugin.Plugin
 

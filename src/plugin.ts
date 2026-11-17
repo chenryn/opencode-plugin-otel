@@ -32,6 +32,8 @@ import {
 import { handleToolCalled, handleToolFailed, handleToolInputStarted, handleToolProgress, handleToolSuccess } from "./handlers/tool.ts"
 import { handlePermissionAsked, handlePermissionReplied } from "./handlers/permission.ts"
 import { captureModelContext, handleModelRequest } from "./handlers/chat-headers.ts"
+import { setupGuard, type GuardTelemetry } from "./guard/guard.ts"
+import { handlePromptDefense, type PromptDefenseOptions } from "./guard/prompt-defense-hook.ts"
 
 const PLUGIN_VERSION: string = (pkg as { version?: string }).version ?? "unknown"
 const EXIT_HOOK_KEY = "__opencode_plugin_otel_exit_hook__"
@@ -54,9 +56,18 @@ export async function setup(ctx: OpenCodeContext): Promise<() => Promise<void>> 
     else console.log(line, extra ?? "")
   }
 
-  if (!config.enabled) {
+  if (!config.enabled && !config.guard.guardEnabled) {
     await log("info", "telemetry disabled (set OPENCODE_ENABLE_TELEMETRY or the enabled option to enable)")
     return async () => {}
+  }
+
+  if (!config.enabled) {
+    // guard-only mode: the runtime guard runs without the OTel SDK; decisions are
+    // enforced and logged to the server console but not exported.
+    const guardTeardownOnly = await setupGuard(ctx, config.guard, null, log)
+    return async () => {
+      await guardTeardownOnly()
+    }
   }
 
   config.otlpHeadersHelper = resolveHelperPath(
@@ -141,15 +152,31 @@ export async function setup(ctx: OpenCodeContext): Promise<() => Promise<void>> 
     await log("info", "prompt-in-logs capture enabled - full prompt text emitted in the `prompt` attribute of user_prompt log events")
   }
 
+  let guardTeardown: (() => Promise<void>) | null = null
+  if (config.guard.guardEnabled) {
+    const guardTelemetry: GuardTelemetry = { hctx }
+    guardTeardown = await setupGuard(ctx, config.guard, guardTelemetry, log)
+  }
+
   const scoped = (sessionID: string) => contextForSession(
     sessionID,
     hctx,
     async (id) => ctx.session.get({ sessionID: id }),
   )
 
-  if (config.captureModelContext) {
+  // A single context hook serves both model-context capture and prompt defense;
+  // registering it twice would double the callbacks on the same event.
+  if (config.captureModelContext || config.guard.guardPromptDefense) {
+    const promptDefenseOptions: PromptDefenseOptions = {
+      minGrade: config.guard.guardPromptDefenseMinGrade,
+      injectContext: config.guard.guardPromptDefenseInjectContext,
+      failMode: config.guard.guardFailMode ?? "fail_open",
+    }
     await ctx.session.hook("context", async (event) => {
-      captureModelContext(event, await scoped(event.sessionID))
+      if (config.captureModelContext) captureModelContext(event, await scoped(event.sessionID))
+      if (config.guard.guardPromptDefense) {
+        await handlePromptDefense(event as never, hctx, promptDefenseOptions, log)
+      }
     })
   }
 
@@ -287,6 +314,7 @@ export async function setup(ctx: OpenCodeContext): Promise<() => Promise<void>> 
     })
 
   return async () => {
+    if (guardTeardown) await guardTeardown()
     controller.abort()
     await running.catch(() => {})
     await flush.drain()

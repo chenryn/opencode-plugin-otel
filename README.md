@@ -1,238 +1,417 @@
 # opencode-plugin-otel
 
-[![npm version](https://img.shields.io/npm/v/@devtheops/opencode-plugin-otel.svg)](https://www.npmjs.com/package/@devtheops/opencode-plugin-otel)
-[![npm downloads](https://img.shields.io/npm/dm/@devtheops/opencode-plugin-otel.svg)](https://www.npmjs.com/package/@devtheops/opencode-plugin-otel)
-[![GitHub stars](https://img.shields.io/github/stars/DEVtheOPS/opencode-plugin-otel.svg)](https://github.com/DEVtheOPS/opencode-plugin-otel/stargazers)
-[![Build status](https://img.shields.io/github/actions/workflow/status/DEVtheOPS/opencode-plugin-otel/release-please.yml?branch=main)](https://github.com/DEVtheOPS/opencode-plugin-otel/actions/workflows/release-please.yml)
+[![npm version](https://img.shields.io/npm/v/@chenryn/opencode-plugin-otel.svg)](https://www.npmjs.com/package/@chenryn/opencode-plugin-otel)
+[![npm downloads](https://img.shields.io/npm/dm/@chenryn/opencode-plugin-otel.svg)](https://www.npmjs.com/package/@chenryn/opencode-plugin-otel)
+[![GitHub stars](https://img.shields.io/github/stars/chenryn/opencode-plugin-otel.svg)](https://github.com/chenryn/opencode-plugin-otel/stargazers)
+[![Build status](https://img.shields.io/github/actions/workflow/status/chenryn/opencode-plugin-otel/release-please.yml?branch=main)](https://github.com/chenryn/opencode-plugin-otel/actions/workflows/release-please.yml)
 [![Discord notifications](https://img.shields.io/badge/discord-notifications-5865F2?logo=discord&logoColor=white)](https://discord.gg/zavuskz8xB)
-[![License](https://img.shields.io/npm/l/@devtheops/opencode-plugin-otel.svg)](https://github.com/DEVtheOPS/opencode-plugin-otel/blob/main/LICENSE)
+[![License](https://img.shields.io/npm/l/@chenryn/opencode-plugin-otel.svg)](https://github.com/chenryn/opencode-plugin-otel/blob/main/LICENSE)
 
-An [opencode](https://opencode.ai) plugin that exports telemetry via OpenTelemetry (OTLP over gRPC or HTTP/protobuf), mirroring the same signals as [Claude Code's monitoring](https://code.claude.com/docs/en/monitoring-usage).
+An [OpenCode](https://opencode.ai) plugin that does two things, both off by default:
 
-> **OpenCode V2 only.** Version `2.x` of this plugin targets **OpenCode `>=2`** and exports the V2
-> `Plugin.define`-style default export (`id: "devtheops.otel"`). The OpenCode V1 plugin is maintained
-> on the [`v1` branch](https://github.com/DEVtheOPS/opencode-plugin-otel/tree/v1) and the `1.x` release
-> line. See [OpenCode version support](#opencode-version-support).
+1. **OpenTelemetry export** — traces, metrics, and log events over OTLP (gRPC or HTTP/protobuf), mirroring the signal set of [Claude Code's monitoring](https://code.claude.com/docs/en/monitoring-usage).
+2. **A built-in runtime guard** (`otel.guard`) — opt-in policy evaluation, a tamper-evident audit chain, tool-input/output controls, and prompt-injection blocking, reusing the same telemetry pipeline.
 
-- [OpenCode version support](#opencode-version-support)
-- [What it instruments](#what-it-instruments)
+> **OpenCode V2 only.** The `2.x` line targets OpenCode `>=2` and exports the V2 `Plugin.define`-style default export (`id: "chenryn.otel"`). The V1 plugin lives on the [`v1` branch](https://github.com/chenryn/opencode-plugin-otel/tree/v1).
+
+## Contents
+
+- [Overview](#overview)
+  - [Two independent capabilities](#two-independent-capabilities)
+  - [Three startup modes](#three-startup-modes)
+  - [OpenCode version support](#opencode-version-support)
+- [How it works](#how-it-works)
+  - [Signal pipeline](#signal-pipeline)
+  - [Trace model](#trace-model)
+  - [Guard decision path](#guard-decision-path)
+  - [Hook ordering](#hook-ordering)
+  - [Prompt defense vs. injection detection](#prompt-defense-vs-injection-detection)
+- [What it emits](#what-it-emits)
   - [Metrics](#metrics)
   - [Traces](#traces)
   - [Log events](#log-events)
-- [Installation](#installation)
+  - [Content, facts, and errors](#content-facts-and-errors)
+- [Runtime guard](#runtime-guard)
+  - [Decision matrix](#decision-matrix)
+  - [Policy files](#policy-files)
+  - [Positive allowlist](#positive-allowlist)
+  - [Tool hooks](#tool-hooks)
+  - [Audit chain](#audit-chain)
+  - [Prompt defense (advisory)](#prompt-defense-advisory)
+  - [Injection blocking (enforceable)](#injection-blocking-enforceable)
+  - [Guard observability](#guard-observability)
 - [Configuration](#configuration)
-  - [Plugin options (opencode.json)](#plugin-options-opencodejson)
+  - [Precedence and boolean semantics](#precedence-and-boolean-semantics)
+  - [Telemetry configuration](#telemetry-configuration)
+  - [Plugin options](#plugin-options)
+  - [Guard configuration](#guard-configuration)
   - [Quick start](#quick-start)
   - [Headers and resource attributes](#headers-and-resource-attributes)
+  - [Host and deployment identity](#host-and-deployment-identity)
   - [Dynamic headers](#dynamic-headers)
   - [Model-visible context capture](#model-visible-context-capture)
   - [LLM trace propagation](#llm-trace-propagation)
-  - [Semantic conventions (`OPENCODE_SEMCONV`)](#semantic-conventions-opencode_semconv)
-  - [Disabling specific metrics](#disabling-specific-metrics)
-  - [Disabling OTLP logs (`OPENCODE_DISABLE_LOGS`)](#disabling-otlp-logs)
-  - [Disabling traces (`OPENCODE_DISABLE_TRACES`)](#disabling-traces)
-  - [SigNoz example](#signoz-example)
-  - [Datadog example](#datadog-example)
-  - [Honeycomb example](#honeycomb-example)
-  - [Claude Code dashboard compatibility](#claude-code-dashboard-compatibility)
+  - [Semantic conventions](#semantic-conventions)
+  - [Disabling signals](#disabling-signals)
+  - [Multi-instance consistency](#multi-instance-consistency)
+  - [Backend examples](#backend-examples)
+- [Installation](#installation)
 - [Local development](#local-development)
 - [GitHub Discord notifications](#github-discord-notifications)
 
-## OpenCode version support
+## Overview
+
+### Two independent capabilities
+
+**Telemetry** observes OpenCode and exports OTel signals. It never changes what the model or tools do. It is enabled with `OPENCODE_ENABLE_TELEMETRY` (or `enabled: true`).
+
+**The guard** makes policy decisions and can enforce them. It is enabled with `OPENCODE_GUARD_ENABLED` (or `guardEnabled: true`) and is a superset of nothing — it does not require telemetry. Individual guard features (audit, tool hooks, injection blocking, prompt scoring) are each separately opt-in.
+
+The two share a configuration fingerprint: all telemetry options must be identical across plugin instances in one process, but **guard options may differ per project**, because guard never touches the shared OTel SDK.
+
+### Three startup modes
+
+| `enabled` | `guardEnabled` | Behavior |
+|-----------|----------------|----------|
+| `false` | `false` | No-op; the plugin logs that telemetry is disabled and returns. |
+| `false` | `true` | **Guard-only.** Policy decisions are enforced and audited to disk; logging goes to the server console. No OTel SDK is created, so no signals are exported. `permission.evaluate`, tool hooks, and injection blocking all work; prompt-defense scoring (a `context` hook registered later in setup) does not run in this mode. |
+| `true` | either | Full telemetry. The guard, if enabled, uses the OTel pipeline for its own events and metrics. |
+
+### OpenCode version support
 
 | Plugin line | OpenCode | Config key | Entrypoint |
 |-------------|----------|------------|------------|
 | `2.x` (`main`) | V2 (`>=2`) | `plugins` | default export `{ id, setup }` |
 | `1.x` (`v1` branch) | V1 | `plugin` | named `OtelPlugin` export |
 
-OpenCode V2 replaced the coarse V1 message events (`message.updated`, `message.part.updated`)
-and removed `command.executed` and `session.diff` from the plugin event stream. It provides
-`permission.asked` / `permission.replied` in place of V1's `permission.updated` / `permission.replied`,
-plus a granular session taxonomy
-(`session.execution.*`, `session.step.*`, `session.tool.*`, `session.usage.updated`,
-`session.retry.scheduled`). This plugin consumes the V2 stream directly, which produces more
-accurate LLM and tool span timings than the V1 implementation.
+V2 replaced the coarse V1 message events (`message.updated`, `message.part.updated`) and removed `command.executed` and `session.diff` from the plugin event stream. It adds `permission.asked` / `permission.replied` in place of V1's `permission.updated`, plus a granular session taxonomy (`session.execution.*`, `session.step.*`, `session.tool.*`, `session.usage.updated`, `session.retry.scheduled`). This plugin consumes the V2 stream directly for more accurate LLM and tool span timings.
 
-**V1 signal parity:** `lines_of_code.count` / `lines_of_code.total` relied on the V1
-`session.diff` event and are not emitted. The V2 client has a session-diff endpoint,
-but the V2 plugin context does not expose it; the VCS diff API is repository-scoped
-and is not an equivalent per-session total. `command.executed` instrumentation is
-replaced by successful shell-tool completion. Message/part spans are replaced by
-per-step LLM spans; completed text segments still populate `output.value` and
-`llm.output_messages`.
+**V1 signal parity:** `lines_of_code.count` / `lines_of_code.total` depended on `session.diff` and are not emitted — the V2 plugin context does not expose a per-session diff endpoint. `command.executed` instrumentation is replaced by successful shell-tool completion. Message/part spans are replaced by per-step LLM spans; completed text segments still populate `output.value` and `llm.output_messages`.
 
-When V2 provides an unambiguous child session ID through subagent tool progress or result metadata,
-subagent run spans nest under the dispatch tool span. Ambiguous or missed correlations fall back to
-the parent run span; a background child may outlive its already-ended dispatch tool span. The
-correlation is also written to attributes: a subagent run span carries `parent_session_id` and,
-when the dispatch is known, `parent_tool_call_id`; the dispatch tool span declares the same
-`parent_tool_call_id` (its own call id) so both sides join on one key.
+When an unambiguous child session ID is available from subagent tool progress or result metadata, the child run span nests under its dispatch tool span. Ambiguous correlations fall back to the parent run span. Both sides carry `parent_tool_call_id` as a join key; the run span also carries `parent_session_id`.
 
-## What it instruments
+## How it works
+
+### Signal pipeline
+
+OpenCode's V2 event stream and hooks feed handlers that maintain per-session trace state and emit three signal types through a shared OTel SDK:
+
+```
+event stream / hooks  ──▶  handlers/*  ──▶  span + metric + log event
+                                             │
+                                             └─▶  OTLP exporter (grpc | http/protobuf | http/json)
+```
+
+The SDK is acquired once per process and reference-counted. Providers are never shut down, so a plugin reload can reuse them. Exporters are rebuilt on authentication failure when a dynamic-header helper is configured, and the failed batch is retried once. A TCP probe (5 s timeout) runs against the endpoint on startup; a failure is logged, not fatal.
+
+Event processing is serialized so an asynchronous session lookup cannot reorder step start/end events. Event attributes prefer the observed session's project ID.
+
+### Trace model
+
+Each user turn produces a run span; each LLM request a child span; each tool call a child of its step:
+
+```
+run span  ({prefix}session / invoke_agent)
+├── LLM step span  ({prefix}llm / chat)        [SpanKind.CLIENT]
+└── tool span  ({prefix}tool.{name} / execute_tool)
+    └── subagent run span  (nested when correlatable)
+```
+
+Span names and attribute keys follow either the OpenInference dialect (default) or the GenAI dialect — see [Semantic conventions](#semantic-conventions). Spans are never `activate`d; parentage is passed explicitly via context objects, and log events are stamped with the target span's trace/span id. This keeps correlation deterministic under concurrent sessions.
+
+### Guard decision path
+
+The guard registers up to three hooks, all optional except `permission.evaluate`:
+
+```
+session.prompt          ── scan user input ──────────────┐
+                                                        │ (may throw to block)
+tool.execute.before     ── stage typed args              │
+                        ── check positive allowlist      │
+                                                        ▼
+permission.evaluate     ── evaluators ─▶ decision ─▶ effect (allow / ask / deny)
+                           ├ rules
+                           └ tool-allowlist (only when flagged)
+                        ── write audit entry
+                        ── emit policy.decision
+                                                        │
+tool.execute.after      ── redact output / audit errors ─┘
+```
+
+**Evaluators run independently.** Each is wrapped in `try/catch`: a throwing evaluator becomes a fail-closed `deny` candidate attributed to its id, without hiding the others. Candidates merge by precedence `deny > review > warn > allow > passthrough`; on a tie, a candidate carrying a real rule wins over a generic fail-closed candidate. The `rules` evaluator is always installed; `tool-allowlist` is added only when the before hook flagged a violation.
+
+The guard never throws from the decision path — it changes `event.effect`. For `ask`, OpenCode's own permission engine takes over (see [Hook ordering](#hook-ordering)).
+
+### Hook ordering
+
+Understanding the order explains two design choices:
+
+1. **`tool.execute.before` runs before the tool's own `permission.assert`**, which is where `permission.evaluate` fires. The before hook stages the structured `input` by tool call id (`event.id`) in a bounded (512 entries), 5-minute-TTL map. When the permission event arrives with `source: { type: "tool", id }`, the guard looks up that call and uses the real typed arguments for `command_regex` matching, shell analysis, and the audit digest. Calls without a tool source fall back to the flattened `resources` strings. The after hook removes the staged entry by the same call id.
+2. **`effect: "ask"` is a real server-side decision.** In enforce mode, a `review` verdict with base effect `allow` becomes `ask`. OpenCode then pauses the tool call and runs its normal `permission.asked` → `permission.replied` flow. The guard does not implement an approval UI; it only raises `allow` to `ask` and relaxes an existing `ask` to `allow` when a rule permits. It never tightens an existing `ask` or `deny`. (Earlier AGT guidance that plugins cannot issue a server-side `ask` applied to the V1 hook contract; V2 supports it.)
+
+### Prompt defense vs. injection detection
+
+These are different mechanisms and are deliberately kept separate:
+
+| | Prompt defense | Injection detection |
+|---|---|---|
+| Scans | The **system prompt** (model-visible `event.system`) | The **user prompt** (`event.prompt.text`) |
+| Method | 12 OWASP-aligned defense vectors; each vector's regex hits produce a coverage score and grade (A ≥ 90 … F ≥ 0) | 9 specific attack signatures (instruction override, role takeover, fake `<system>` tags, prompt-leak requests, jailbreak, plus Chinese variants) and zero-width / homoglyph obfuscation |
+| Hook | `session.hook("context")`, only when telemetry is fully enabled | `session.hook("prompt")`, registered inside `setupGuard` (works in guard-only mode) |
+| Blocks? | **Never.** Emits `prompt_defense` with a `blocking` attribute and log level; catches all errors. | Only when `guardPromptInjectionBlock` + `enforce` + a finding at or above `guardPromptInjectionMinSeverity` → throws `PromptInjectionBlocked`. |
+| Records | Hash + grade + vector ids; never prompt text | Hash + finding ids + severity; never prompt text |
+
+**Why defense grade cannot gate requests:** it measures how many *defensive instructions* a prompt contains. A normal user request scores 0/12 (F), so using that grade to block would deny every normal prompt. Blocking is therefore driven by the separate attack-signature detector. Its patterns are intentionally specific — "ignore network errors", "handle `system:` prefixes", and "act as a judge" all produce zero findings.
+
+## What it emits
 
 ### Metrics
 
+Metrics are prefixed with `OPENCODE_METRIC_PREFIX` (default `opencode.`) unless they are GenAI-standard names, which are never prefixed.
+
 | Metric | Type | Description |
 |--------|------|-------------|
-| `opencode.session.count` | Counter | Incremented on `session.created`, or lazily when a pre-existing session is first observed |
-| `opencode.token.usage` | Counter | Per token type: `input`, `output`, `reasoning`, `cacheRead`, `cacheCreation` (per `session.step.ended`) |
+| `opencode.session.count` | Counter | Sessions started, or lazily on first observation of a pre-existing session |
+| `opencode.token.usage` | Counter | Tokens by type: `input`, `output`, `reasoning`, `cacheRead`, `cacheCreation` |
 | `opencode.cost.usage` | Counter | USD cost per completed LLM step |
-| `opencode.commit.count` | Counter | `git commit` commands observed in successful, executed shell-tool calls; Git's resulting repository state is not verified |
-| `opencode.tool.duration` | Histogram | Tool execution time in milliseconds |
-| `opencode.cache.count` | Counter | Cache activity per step: `type=cacheRead` or `type=cacheCreation` |
-| `opencode.session.duration` | Histogram | Observed duration from session creation (or first observation) to execution end / idle in milliseconds |
-| `opencode.message.count` | Counter | Assistant messages with a completed or failed LLM step |
-| `opencode.session.token.total` | Histogram | Total tokens consumed per session, recorded when an execution ends |
-| `opencode.session.cost.total` | Histogram | Total cost per session in USD, recorded when an execution ends |
+| `opencode.commit.count` | Counter | `git commit` seen in a successful shell tool call (the resulting repo state is not verified) |
+| `opencode.tool.duration` | Histogram | Tool execution time in ms |
+| `opencode.cache.count` | Counter | Cache read/write activity per step (`type=cacheRead` / `cacheCreation`) |
+| `opencode.session.duration` | Histogram | Session creation (or first observation) to execution end / idle, in ms |
+| `opencode.message.count` | Counter | Assistant messages with a completed or failed step |
+| `opencode.session.token.total` | Histogram | Total tokens per session, recorded when an execution ends |
+| `opencode.session.cost.total` | Histogram | Total USD cost per session, recorded when an execution ends |
 | `opencode.model.usage` | Counter | Messages per model and provider |
-| `opencode.retry.count` | Counter | API retries observed via durable `session.retry.scheduled` events (attributes: `retry.attempt`, `error.type`; not added to normal calls) |
+| `opencode.retry.count` | Counter | API retries from `session.retry.scheduled` events (`retry.attempt`, `error.type`); never added to normal calls |
 | `opencode.subtask.count` | Counter | Sub-agent sessions observed via `session.created` with a `parentID` |
-| `opencode.exporter.export.failures` | Counter | Failed OTLP export batches, by `signal` (`traces`/`metrics`/`logs`) and `error.type` (`auth`/`unavailable`/`timeout`/`other`). Counted per batch, never per span, and only on failure so an outage cannot amplify the metric stream |
-| `opencode.exporter.auth.retry.count` | Counter | Header refreshes triggered by an authentication failure, by `signal` |
+| `opencode.exporter.export.failures` | Counter | Failed OTLP export batches, by `signal` and `error.type`; counted per batch and only on failure |
+| `opencode.exporter.auth.retry.count` | Counter | Header refreshes after an auth failure, by `signal` |
 | `opencode.event.dispatch.errors` | Counter | Event-dispatch failures, by `event.type` |
-| `opencode.flush.failures` | Counter | Scheduled flushes where at least one provider failed |
-| `opencode.flush.duration` | Histogram | Duration of a scheduled flush in milliseconds |
+| `opencode.flush.failures` | Counter | Scheduled flushes with at least one failing provider |
+| `opencode.flush.duration` | Histogram | Scheduled flush duration in ms |
+| `opencode.guard.decisions` | Counter | Guard `permission.evaluate` decisions (opt-in) |
+| `opencode.guard.tool.actions` | Counter | Guard tool actions: `staged` / `allowlist_denied` / `redacted` / `tool_error` (opt-in) |
 
-Under [`OPENCODE_SEMCONV=gen_ai`](#semantic-conventions-opencode_semconv) the inference and tool metrics are
-replaced by their official GenAI counterparts, which are **never prefixed** and therefore unaffected by
-`OPENCODE_METRIC_PREFIX`. `opencode.token.usage` and `opencode.tool.duration` are not emitted at all in that mode.
+Under `OPENCODE_SEMCONV=gen_ai`, the inference and tool metrics are replaced by their official counterparts, which are never prefixed and ignore `OPENCODE_METRIC_PREFIX`. `opencode.token.usage` and `opencode.tool.duration` are not emitted at all in that mode:
 
 | Metric | Type | Description |
 |--------|------|-------------|
 | `gen_ai.client.inference.duration` | Histogram | LLM request duration in seconds, with `error.type` on failure |
-| `gen_ai.client.inference.usage.input_tokens` | Counter | Input tokens, including cache reads and writes; `gen_ai.token.modality=unknown` because the provider reports one aggregate count |
-| `gen_ai.client.inference.usage.output_tokens` | Counter | Output tokens, including reasoning; `gen_ai.token.modality=text` |
+| `gen_ai.client.inference.usage.input_tokens` | Counter | Input tokens including cache reads/writes (`gen_ai.token.modality=unknown`) |
+| `gen_ai.client.inference.usage.output_tokens` | Counter | Output tokens including reasoning (`gen_ai.token.modality=text`) |
 | `gen_ai.client.inference.usage.cache_read.input_tokens` | Counter | Cache-read input tokens, a subset of the input counter |
 | `gen_ai.client.inference.usage.cache_write.input_tokens` | Counter | Cache-write input tokens, a subset of the input counter |
 | `gen_ai.client.inference.usage.reasoning.output_tokens` | Counter | Reasoning output tokens, a subset of the output counter |
 | `gen_ai.execute_tool.duration` | Histogram | Tool execution time in seconds, with `error.type` on failure |
 | `gen_ai.server.time_to_first_token` | Histogram | Time to first streamed token in seconds (emitted in both dialects) |
 
+> These names track the current `semantic-conventions-genai` revision, not the 1.40 release, which used `gen_ai.client.token.usage` and `gen_ai.client.operation.duration`. A dashboard written for 1.40 needs a rename or a collector transform.
+
 ### Traces
 
-Each user turn produces a `{prefix}session` run span, each LLM request a `{prefix}llm` child of that run,
-and each tool call a `{prefix}tool.{name}` child of its step. Subagent runs nest under their dispatch tool
-span when the child session ID can be correlated. `{prefix}` is `OPENCODE_METRIC_PREFIX`.
+Span naming by dialect:
 
-Spans are emitted in the OpenInference dialect by default. Set
-[`OPENCODE_SEMCONV=gen_ai`](#semantic-conventions-opencode_semconv) to emit the OpenTelemetry GenAI
-conventions instead, including the operation-qualified span names (`invoke_agent`, `chat`, `execute_tool`).
+| Concept | `openinference` (default) | `gen_ai` |
+|---------|---------------------------|----------|
+| Run span | `{prefix}session` | `invoke_agent {agent}` |
+| LLM span | `{prefix}llm` | `chat {model}` |
+| Tool span | `{prefix}tool.{tool}` | `execute_tool {tool}` |
+| Span type key | `openinference.span.kind` = `AGENT`/`LLM`/`TOOL` | `gen_ai.operation.name` = `invoke_agent`/`chat`/`execute_tool` |
+
+The full attribute mapping — session/agent/model/provider identity, input/output message shapes, token and cost keys, tool call fields, turn/step correlation, and error fields — is in [Semantic conventions](#semantic-conventions).
 
 ### Log events
 
 | Event | Description |
 |-------|-------------|
 | `session.created` | Session started |
-| `session.idle` | Session went idle (includes total tokens, cost, messages) |
+| `session.idle` | Session went idle (totals for tokens, cost, messages) |
 | `session.error` | Execution failed |
-| `user_prompt` | User prompt durably admitted via `session.inbox.enqueued` (includes `prompt_length`, `delivery`; also `prompt` when `OPENCODE_CAPTURE_PROMPT_IN_LOGS` is set) |
+| `user_prompt` | User prompt durably admitted via `session.inbox.enqueued` (`prompt_length`, `delivery`; also `prompt` when `OPENCODE_CAPTURE_PROMPT_IN_LOGS` is set) |
 | `api_request` | Completed LLM step (tokens, cost) |
-| `api_error` | Failed LLM step (error summary) |
+| `api_error` | Failed LLM step (structured error) |
 | `tool_result` | Tool completed or errored (duration, success, output size) |
 | `permission.requested` | Permission prompt asked (`permission.action`, `permission.resources`, `request.id`, `target.tool_call.id`, `target.span.id`) |
-| `tool_decision` | Permission prompt answered (accept/reject); carries the same `request.id` and target correlation plus `permission.action` only — it never records a policy verdict |
+| `tool_decision` | Permission answered (accept/reject), with the same correlation keys; never records a policy verdict |
 | `commit` | Git commit detected |
-| `subtask_invoked` | Sub-agent session created (agent and parent session ID) |
+| `subtask_invoked` | Sub-agent session created (agent and parent session id) |
+| `policy.decision` | Guard verdict per `permission.evaluate` (opt-in) |
+| `guard.tool.before` / `guard.tool.after` | Tool staging, allowlist verdict, output redaction, failed-call audit (opt-in) |
+| `guard.prompt.injection` | User-prompt injection finding: ids, severity, hash, blocked flag — never prompt text (opt-in) |
+| `prompt_defense` | System-prompt defense coverage: grade, score, finding ids — never prompt text (opt-in) |
 
-Under [`OPENCODE_SEMCONV=gen_ai`](#semantic-conventions-opencode_semconv), `session.created`, `api_request`,
-`api_error`, and `tool_result` duplicate a span (`invoke_agent`, `chat`, `execute_tool`) that already carries
-the same information. They are **emitted by default** so an audit timeline keeps every lifecycle marker;
-set `OPENCODE_EMIT_REDUNDANT_EVENTS=0` to suppress them when a backend counts spans and events together and
-would otherwise double count. The remaining events keep their `event.name` schema but swap their identity
-attributes for GenAI keys (`gen_ai.conversation.id`, `gen_ai.agent.name`, `gen_ai.request.model`,
-`gen_ai.provider.name`, `gen_ai.tool.name`); `session.id` is kept in both dialects as the cross-signal join key.
+In the `gen_ai` dialect, `session.created`, `api_request`, `api_error`, and `tool_result` duplicate a span that already carries the same information. They are emitted by default so an audit timeline keeps every lifecycle marker; set `OPENCODE_EMIT_REDUNDANT_EVENTS=0` to suppress them when spans and events feed the same backend. Other events keep their `event.name` schema but use GenAI identity keys (`gen_ai.conversation.id`, `gen_ai.agent.name`, `gen_ai.request.model`, `gen_ai.provider.name`, `gen_ai.tool.name`); `session.id` remains the cross-signal join key in both dialects.
 
-Every failure event (`api_error`, `session.error`, `tool_result` with `success=false`, and a rejected
-`tool_decision`) carries the structured error verbatim: `error.type` is the grouping key, `error.message`
-and `error.status` keep the details that a flattened `"type: message"` string would lose. A rejected
-permission records `permission.decision=reject` with `error.type=permission_denied`; it reports the fact
-only and never enforces policy.
+### Content, facts, and errors
 
-Tool spans and `tool_result` events also carry the fact layer, which is metadata rather than content:
-`tool.command` (verbatim command of shell tools) and `file.operation` / `file.path` / `file.paths`
-(`read`, `write`, `edit`, `list`, `glob`, `search`). Facts are emitted even when content capture is off,
-because they are what audits search on; set `OPENCODE_CAPTURE_TOOL_FACTS=0` to suppress them when raw
-commands must not leave the host. The plugin never writes a judgement field (`risk.*`, `policy.*`,
-`audit.*`) — detection and enforcement belong to an external rule engine.
+Every failure event (`api_error`, `session.error`, `tool_result` with `success=false`, rejected `tool_decision`) carries a structured error: `error.type` is the grouping key, with `error.message` and `error.status` preserved. A rejected permission records `permission.decision=reject` with `error.type=permission_denied` — it reports the fact only and never enforces policy.
 
-Every content-bearing attribute is capped at 20,000 characters. A truncated value always carries
-`<field>.truncated=true` and `<field>.original_length`, where `<field>` is `tool.arguments`,
-`tool.result`, `content.output`, `content.input`, `prompt`, or `tool.command`; counters such as `prompt_length`
-and `tool.result_size_bytes` always report the original size. A multi-path list that is cut also reports
-`file.paths.truncated` and `file.paths.original_count`.
+Tool spans and `tool_result` events carry a **fact layer**, emitted even when content capture is off: `tool.command` (verbatim shell command) and `file.operation` / `file.path` / `file.paths` (`read`, `write`, `edit`, `list`, `glob`, `search`). Set `OPENCODE_CAPTURE_TOOL_FACTS=0` to suppress it when raw commands must not leave the host. The passive telemetry path writes no judgement fields; detection and enforcement belong to the opt-in guard.
 
-## Installation
+Content-bearing attributes are capped at 20,000 characters. A truncated value carries `<field>.truncated=true` and `<field>.original_length` (`tool.arguments`, `tool.result`, `content.output`, `content.input`, `prompt`, `tool.command`); counters such as `prompt_length` and `tool.result_size_bytes` always report the original size. A cut multi-path list also reports `file.paths.truncated` and `file.paths.original_count`.
 
-Add the plugin to your opencode config at `~/.config/opencode/opencode.json`:
+## Runtime guard
+
+All guard features are off unless `guardEnabled` is set. Decisions are resolved through isolated evaluators; telemetry failures never affect enforcement, and the decision path never awaits or throws on observability.
+
+**Origin.** `otel.guard` is an original, dependency-free implementation inspired by
+[Microsoft's Agent Governance Toolkit](https://github.com/microsoft/agent-governance-toolkit)
+(AGT, MIT). Concretely borrowed: the fail-closed evaluator pattern (`deniedBy` attribution),
+RFC 8785 canonical JSON and the hash-chained audit shape from AGT's `lib/audit.mjs`,
+`PromptDefenseEvaluator`'s 12-vector scoring model, and the literal injection-pattern tables
+from its MCP scanner. AGT's PolicyEngine backend system, server-side approval flow, and
+standalone MCP scanner were **not** adopted — OpenCode V2's `permission.evaluate` already
+provides a real server-side `ask`, and the guard reuses this plugin's telemetry pipeline
+instead of shipping its own.
+
+### Decision matrix
+
+Evaluator verdicts merge by precedence `deny > review > warn > allow > passthrough`, then resolve against the mode and the base effect OpenCode already decided:
+
+| Verdict | `monitor_only` | `enforce` |
+|---------|----------------|-----------|
+| `allow` | effect unchanged, `allowed` | base `ask` → `allow` (relaxed-from-ask); otherwise unchanged |
+| `warn` | effect unchanged, `warned` | unchanged in every mode — never blocks |
+| `review` | effect unchanged, `review` | base `allow` → `ask` (raised-from-allow); base `ask`/`deny` unchanged |
+| `deny` | effect unchanged, `would_denied` | effect → `deny`, `denied` |
+| no match | effect unchanged, `passthrough` | unchanged |
+
+`monitor_only` is a shadow mode: deny hits are labelled `would_denied` but never mutate the effect. `enforce` never relaxes a `deny` and never tightens an existing `ask`.
+
+If the decision path itself throws outside an evaluator (for example, the policy is not loaded), `failMode` decides: `fail_closed` returns `effect: "deny"` with decision `degraded`; `fail_open` keeps the base effect, also `degraded`. An evaluator throwing is always a fail-closed deny candidate, independent of `failMode`.
+
+### Policy files
+
+`guardPolicyPath` points to a JSON file, hot-reloaded with a non-persistent watcher and last-good retention (a bad reload keeps the previous policy and logs a warning).
 
 ```json
 {
-  "$schema": "https://opencode.ai/config.json",
-  "plugins": ["@devtheops/opencode-plugin-otel"]
+  "version": "v1",
+  "settings": {
+    "mode": "monitor_only",
+    "fail_mode": "fail_open",
+    "unmatched": "passthrough"
+  },
+  "rules": [
+    {
+      "id": "deny-rm-rf",
+      "name": "Destructive recursive delete",
+      "type": "deny",
+      "severity": "high",
+      "description": "Blocks rm -rf against any path",
+      "tools": ["bash", "shell"],
+      "match": { "command_regex": "\\brm\\s+-[a-z]*r[a-z]*f\\b" }
+    }
+  ]
 }
 ```
 
-For local development, install dependencies with `bun install` in the checkout and
-create `.opencode/plugins/otel/index.ts` in the project where OpenCode runs:
+- `id` must be non-empty and match `[\w.\-]+`; `name` and `type` are required. `type` is `allow`, `deny`, `review`, or `warn`.
+- `tools` filters by lowercased tool name; omitted or empty means all tools. `severity` defaults to `medium`.
+- A rule needs at least one matcher: `command_regex` (case-insensitive by default) and/or `resource_contains` (lower-cased substring). `command_regex_flags` accepts only `i` and `u` — the stateful/multiline `g`/`y`/`m`/`s` flags are rejected, as are empty sources, sources over 2,048 characters, and patterns that match the empty string.
+- `version_sha256` is `sha256:` plus the hash of the raw document in RFC 8785 canonical JSON, so reordering keys does not create a false version change.
+- `guardMode` and `guardFailMode` (option or env) override the file's `settings.mode` / `settings.fail_mode` entirely. Default when neither source provides a value: `monitor_only` / `fail_open`.
 
-```ts
-export { default } from "/path/to/opencode-plugin-otel/src/index.ts"
+### Positive allowlist
+
+When `guardToolAllowlistPath` exists, tools with an entry accept only matching commands or URLs. A missing or invalid file leaves the feature passive; no tool is constrained by default. The file is hot-reloaded and uses the same canonical hash for its version.
+
+```json
+{
+  "version": "v1",
+  "tools": {
+    "bash": { "command_prefixes": ["ls ", "pwd", "git status"] },
+    "webfetch": { "url_prefixes": ["https://github.com/", "https://registry.npmjs.org/"] }
+  }
+}
 ```
 
-OpenCode V2 discovers this directory automatically. On OpenCode `2.0.1`, a
-`plugins` package entry pointing directly to an absolute `.ts` file is rejected;
-the package loader expects a directory.
+Prefixes are case-insensitive (`startsWith`), capped at 256 entries of 2,048 characters each, and lowercased on load. Shell tools are checked against `command_prefixes`; fetch-like tools (`webfetch`, `fetch`, `http`, `curl`) against `url_prefixes`. Tools with no entry are not allowlisted. A violation is a deny candidate at `permission.evaluate` (`tool-allowlist`), following the same mode and audit rules as a policy deny.
+
+### Tool hooks
+
+`guardToolHooks` registers the V2 `tool.execute.before` and `tool.execute.after` hooks. These are single-object mutable hooks: `before` sees structured `input`, and `after` sees a mutable `result` or an `error`. Both are fail-open — a hook error is logged but never changes the tool outcome.
+
+- **Structured-argument staging.** `before` stores typed input by call id for the permission decision and audit digest (see [Hook ordering](#hook-ordering)).
+- **Output redaction.** With `guardToolRedact` plus `guardMode: "enforce"`, `after` replaces known credentials in `result.content` with `[REDACTED:<pattern>]` before the model sees them: AWS access keys, GitHub PATs, OpenAI keys, JWTs, PEM private keys, and Azure storage keys. In `monitor_only` the same patterns are reported as `would_redact` but never mutated. Only the event's `result` object changes — never the on-disk tool output.
+- **Failed-call audit.** `after` records a `tool_error` audit entry with a bounded error excerpt when a call reports `status: "error"`, covering failures that never reach an output hook.
+
+### Audit chain
+
+`guardAuditEnabled` appends a tamper-evident entry for every decision (and for tool errors / redactions when the tool hooks are on).
+
+Each v2 entry carries `v`, `timestamp`, `agentId` (`opencode:<sessionID>`), `action`, `decision`, `previousHash`, `hash`, and optional `policyVersion`, `reason`, `argsDigest`, `argsDigestAlg`, `argsTruncated`, `argsUnserializable`, and `principal`. The hash covers every other field via RFC 8785 canonical JSON; `previousHash` links to the chain head (`"0"*64` for a new chain). Verification walks the chain with a constant-time hash compare and rejects version downgrades.
+
+- The chain keeps the most recent 10,000 entries. On rollover the last evicted hash is retained as `seamHash`, so the surviving head still anchors to something verifiable.
+- Argument digests are SHA-256 by default, or HMAC-SHA256 when `OPENCODE_GUARD_AUDIT_HMAC_KEY` (≥32 UTF-8 bytes) is set. Payloads over 1 MiB are truncated and flagged; unserializable values use a sentinel.
+- Writes are serialized through a single queue and committed atomically (temp file + rename), never awaited on the decision path. A broken chain or fs error only logs — enforcement is unaffected.
+- A short HMAC key disables the entire audit with an error log.
+
+### Prompt defense (advisory)
+
+`guardPromptDefense` scores the model-visible system prompt against 12 OWASP-aligned defense vectors and emits `prompt_defense` with `grade`, `score`, `coverage`, `defended`, `total`, `missing`, and `prompt_hash` — never the prompt text. A finding below `guardPromptDefenseMinGrade` (default `B`) only raises the log level; it never blocks.
+
+`guardPromptDefenseInjectContext` idempotently appends ten governance instructions to the system prompt before scoring. The bundled context scores A (12/12). Injection changes what the model sees, so roll it out separately from enforcement. This hook runs only when telemetry is fully enabled (not in guard-only mode).
+
+### Injection blocking (enforceable)
+
+`guardPromptInjectionBlock` registers a `session.prompt` hook that scans **user input** for attack signatures and can stop the request before it reaches the model. It blocks only when all three conditions hold: the option is on, `guardMode` is `enforce`, and a finding meets `guardPromptInjectionMinSeverity` (default `high`; obfuscation-only findings count as `medium`). Every finding — blocked or not — emits `guard.prompt.injection` with finding ids, severity, and a hash. On a scan error, `failMode` decides whether to block (`fail_closed`) or log only (`fail_open`). This is the guard's only throw-based block.
+
+### Guard observability
+
+Every `permission.evaluate` emits `policy.decision` with the verdict, mode, base/effective effect, policy hash, matched rule ids, a bounded resource excerpt, shell analysis for shell actions (`shell.obfuscated`, `shell.atoms_count`, `shell.dangerous_ops`, `shell.injection_patterns`, `shell.zero_width`, `shell.homoglyph`, `shell.safe_cleanup`), deny attribution (`policy.denied_by`, `policy.errored_evaluators`), audit markers, and tool-span correlation when the call is already traced. Denials in enforce mode also surface as `session.tool.failed` events so the tool span records the interception.
+
+Guard counters: `opencode.guard.decisions` (attribute `policy.decision`, `policy.mode`, `permission.action`, optionally `policy.rule_id` and `policy.denied_by`) and `opencode.guard.tool.actions` (`guard.tool.action`, `tool_name`).
 
 ## Configuration
 
-The plugin reads its settings from `OPENCODE_*` environment variables and/or from inline [plugin options](#plugin-options-opencodejson) in `opencode.json`. When both are present, an option wins over the matching environment variable, which wins over the built-in default.
+Configuration comes from `OPENCODE_*` environment variables and/or inline plugin options. An option wins over its env variable, which wins over the built-in default.
 
-When OpenCode loads multiple locations in one process, all enabled instances must
-use identical telemetry configuration. A conflicting endpoint, authentication,
-resource attribute, metric prefix, or signal option fails setup rather than
-exporting one location's data using another location's settings. Event attributes
-use the observed session's project ID when available. Shared event processing is
-serialized so an asynchronous session lookup cannot reorder step start/end events.
+### Precedence and boolean semantics
 
-The environment variables (set them in your shell profile — `~/.zshrc`, `~/.bashrc`, etc.):
+Two boolean conventions coexist — worth knowing when scripting configuration:
+
+- Most flags (`enabled`, `capturePromptInLogs`, `captureModelContext`, and all guard booleans except `guardEmitUnmatched`) use "non-empty means true": values like `"0"` or `"false"` still **enable** the flag.
+- `captureToolFacts`, `emitRedundantEvents`, and `guardEmitUnmatched` use opt-out parsing: unset/empty → enabled; `0`, `false`, `no`, `off` → disabled; any other non-empty value → enabled.
+- `logsEnabled` is driven by the inverse env `OPENCODE_DISABLE_LOGS`: presence (even `=false`) disables OTLP logs.
+- An explicitly invalid option usually falls through to the env value, with a warning for `semconv` and `metricsTemporality`. Two exceptions keep the default instead: `guardPromptDefenseMinGrade` and `guardPromptInjectionMinSeverity`.
+
+### Telemetry configuration
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OPENCODE_ENABLE_TELEMETRY` | *(unset)* | Set to any non-empty value to enable the plugin |
-| `OPENCODE_OTLP_ENDPOINT` | `http://localhost:4317` | OTLP collector endpoint. Always include a URL scheme. For `grpc`, use the collector URL (for example `http://localhost:4317` or `grpc://collector:4317`). For `http/protobuf` and `http/json`, use the base URL and the plugin will append `/v1/traces`, `/v1/metrics`, and `/v1/logs`. |
-| `OPENCODE_OTLP_PROTOCOL` | `grpc` | OTLP transport protocol: `grpc`, `http/protobuf`, or `http/json` |
-| `OPENCODE_OTLP_METRICS_INTERVAL` | `60000` | Metrics export interval in milliseconds |
-| `OPENCODE_OTLP_LOGS_INTERVAL` | `5000` | Logs export interval in milliseconds |
-| `OPENCODE_METRIC_PREFIX` | `opencode.` | Prefix for all metric names (e.g. set to `claude_code.` for Claude Code dashboard compatibility) |
-| `OPENCODE_DISABLE_METRICS` | *(unset)* | Comma-separated list of metric name suffixes to disable (e.g. `cache.count,session.duration`) |
-| `OPENCODE_DISABLE_LOGS` | *(unset)* | Set to any non-empty value to suppress all OTLP log events while leaving metrics and traces unchanged |
-| `OPENCODE_CAPTURE_PROMPT_IN_LOGS` | *(unset)* | Set to any non-empty value to include the full prompt text in the `prompt` attribute of `user_prompt` log events. **Log events only** — trace spans carry an observed prompt in `input.value` regardless of this flag (disable span-level capture separately via `OPENCODE_DISABLE_TRACES`). **Off by default — prompts may contain secrets or PII; enable only for trusted collectors.** |
-| `OPENCODE_CAPTURE_TOOL_FACTS` | enabled | Emit the factual tool layer (`tool.command`, `file.operation`, `file.path`, `file.paths`) on tool spans and `tool_result` events. Set to `0`, `false`, `no`, or `off` to suppress it; independent of `OPENCODE_CAPTURE_MODEL_CONTEXT`. Commands are recorded verbatim and may contain secrets. |
-| `OPENCODE_CAPTURE_MODEL_CONTEXT` | *(unset)* | Set to any non-empty value to attach a bounded text-only preview of the primary model-visible context to LLM spans. Off by default; can include system instructions, earlier messages, and tool text. Under `OPENCODE_SEMCONV=gen_ai` this flag also gates every content-bearing GenAI attribute (`gen_ai.input.messages`, `gen_ai.output.messages`, `gen_ai.tool.call.arguments`, `gen_ai.tool.call.result`) and the `prompt` log attribute, because those are Opt-In in the GenAI conventions. |
-| `OPENCODE_DISABLE_TRACES` | *(unset)* | Comma-separated list of trace types to disable (`session`, `llm`, `tool`). Use `all`, `*`, `true`, or `1` to disable every trace type |
-| `OPENCODE_OTLP_HEADERS` | *(unset)* | Comma-separated `key=value` headers added to all OTLP exports. **Keep out of version control — may contain sensitive auth tokens.** |
-| `OPENCODE_OTLP_HEADERS_HELPER` | *(unset)* | Executable script/binary that returns dynamic OTLP headers as JSON after an auth failure. Helper headers override `OPENCODE_OTLP_HEADERS`. |
-| `OPENCODE_RESOURCE_ATTRIBUTES` | *(unset)* | Comma-separated `key=value` pairs merged into the OTel resource. Example: `service.version=1.2.3,deployment.environment=production` |
-| `OPENCODE_SPAN_ATTRIBUTES` | *(unset)* | Comma-separated `key=value` pairs attached to every emitted span, log event, and metric data point. Example: `team=platform,deployment.environment=production` |
-| `OPENCODE_OTLP_METRICS_TEMPORALITY` | *(unset)* | Metrics aggregation temporality: `delta`, `cumulative`, or `lowmemory`. Required for Datadog (`delta`). Passed to the exporter and copied to `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE`. |
-| `OPENCODE_TRACEPARENT` | *(unset)* | W3C [`traceparent`](https://www.w3.org/TR/trace-context/#traceparent-header) string. When set, all spans are parented under this remote context so opencode traces nest inside a caller's trace (e.g. a CI job). Invalid values are logged and ignored. Note: with the default `ParentBased` sampler, a value with the sampled flag off (`...-00`) suppresses all trace export. |
-| `OPENCODE_TRACESTATE` | *(unset)* | W3C [`tracestate`](https://www.w3.org/TR/trace-context/#tracestate-header) string, parsed alongside `OPENCODE_TRACEPARENT` and attached to the remote parent context. Ignored unless a valid `OPENCODE_TRACEPARENT` is also set. |
-| `OPENCODE_TRACE_PROPAGATION_PROVIDERS` | *(unset)* | Comma-separated opencode provider IDs that receive W3C `traceparent` and `tracestate` headers on LLM requests. Use `*` to explicitly enable every provider. |
-| `OPENCODE_SEMCONV` | `openinference` | Wire dialect: `openinference` (OpenInference conventions) or `gen_ai` (OpenTelemetry GenAI conventions). Switches span attributes, metric names, and log-event attributes together. See [Semantic conventions](#semantic-conventions-opencode_semconv). |
-| `OPENCODE_EMIT_REDUNDANT_EVENTS` | enabled | Set to `0`, `false`, `no`, or `off` to suppress the `gen_ai` log events that duplicate a span (`session.created`, `api_request`, `api_error`, `tool_result`). Leave enabled when spans and events feed the same dashboards and you need a complete audit timeline; disable to avoid double counting. |
+| `OPENCODE_ENABLE_TELEMETRY` | *(unset)* | Non-empty enables the plugin |
+| `OPENCODE_OTLP_ENDPOINT` | `http://localhost:4317` | Full URL with scheme. For `http/*`, the plugin appends `/v1/traces`, `/v1/metrics`, `/v1/logs` |
+| `OPENCODE_OTLP_PROTOCOL` | `grpc` | `grpc`, `http/protobuf`, or `http/json` |
+| `OPENCODE_OTLP_METRICS_INTERVAL` | `60000` | Metrics export interval in ms |
+| `OPENCODE_OTLP_LOGS_INTERVAL` | `5000` | Log batch delay in ms |
+| `OPENCODE_METRIC_PREFIX` | `opencode.` | Prefix for metric names and span names; also used for Claude Code dashboard compatibility |
+| `OPENCODE_DISABLE_METRICS` | *(unset)* | Comma-separated metric suffixes (no prefix) |
+| `OPENCODE_DISABLE_LOGS` | *(unset)* | Non-empty suppresses all OTLP log events |
+| `OPENCODE_CAPTURE_PROMPT_IN_LOGS` | *(unset)* | Non-empty includes full prompt text in `user_prompt` logs — sensitive; trusted collectors only |
+| `OPENCODE_CAPTURE_TOOL_FACTS` | enabled | `0`/`false`/`no`/`off` suppresses verbatim commands and file paths |
+| `OPENCODE_CAPTURE_MODEL_CONTEXT` | *(unset)* | Non-empty attaches a bounded text-only preview of model context to LLM spans |
+| `OPENCODE_DISABLE_TRACES` | *(unset)* | Comma-separated `session`, `llm`, `tool`; `all`/`*`/`true`/`1` disables all |
+| `OPENCODE_OTLP_HEADERS` | *(unset)* | Comma-separated `key=value` headers for all exports — may contain secrets |
+| `OPENCODE_OTLP_HEADERS_HELPER` | *(unset)* | Executable returning dynamic headers as JSON after an auth failure |
+| `OPENCODE_RESOURCE_ATTRIBUTES` | *(unset)* | Comma-separated `key=value` pairs on the OTel Resource |
+| `OPENCODE_SPAN_ATTRIBUTES` | *(unset)* | Comma-separated `key=value` pairs on spans, logs, and metric points |
+| `OPENCODE_OTLP_METRICS_TEMPORALITY` | *(unset)* | `delta`, `cumulative`, or `lowmemory`; required for Datadog |
+| `OPENCODE_TRACEPARENT` / `OPENCODE_TRACESTATE` | *(unset)* | W3C remote parent context for all spans |
+| `OPENCODE_TRACE_PROPAGATION_PROVIDERS` | *(unset)* | Provider IDs that receive W3C trace headers on LLM requests; `*` for all |
+| `OPENCODE_SEMCONV` | `openinference` | `openinference` or `gen_ai` |
+| `OPENCODE_EMIT_REDUNDANT_EVENTS` | enabled | `0`/`false`/`no`/`off` drops gen_ai log events that duplicate a span |
 
-Prompt logging remains disabled by default. Enable it only when the configured telemetry destination is trusted to receive potentially sensitive prompt contents.
+### Plugin options
 
-### Plugin options (opencode.json)
-
-Every setting can also be passed inline through opencode's plugin **object form**, so nothing has to be exported in a shell. Options take precedence over the matching `OPENCODE_*` environment variable, which in turn wins over the built-in default.
+Every telemetry setting can be passed inline through the plugin object form. Keys mirror the resolved config:
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
   "plugins": [
     {
-      "package": "@devtheops/opencode-plugin-otel",
+      "package": "@chenryn/opencode-plugin-otel",
       "options": {
         "enabled": true,
         "endpoint": "http://localhost:4317",
@@ -246,35 +425,49 @@ Every setting can also be passed inline through opencode's plugin **object form*
 }
 ```
 
-Option keys mirror the resolved config and map to the environment variables:
+| Option | Environment variable | Notes |
+|--------|----------------------|-------|
+| `enabled` | `OPENCODE_ENABLE_TELEMETRY` | |
+| `logsEnabled` | `OPENCODE_DISABLE_LOGS` (inverted) | |
+| `capturePromptInLogs` | `OPENCODE_CAPTURE_PROMPT_IN_LOGS` | |
+| `captureToolFacts` | `OPENCODE_CAPTURE_TOOL_FACTS` | |
+| `captureModelContext` | `OPENCODE_CAPTURE_MODEL_CONTEXT` | |
+| `emitRedundantEvents` | `OPENCODE_EMIT_REDUNDANT_EVENTS` | |
+| `logLevel` | *(option only)* | `debug`, `info`, `warn`, `error`; invalid → `info` |
+| `endpoint` | `OPENCODE_OTLP_ENDPOINT` | |
+| `protocol` | `OPENCODE_OTLP_PROTOCOL` | |
+| `metricsInterval` / `logsInterval` | `OPENCODE_OTLP_METRICS_INTERVAL` / `OPENCODE_OTLP_LOGS_INTERVAL` | |
+| `metricPrefix` | `OPENCODE_METRIC_PREFIX` | |
+| `otlpHeaders` / `otlpHeadersHelper` | `OPENCODE_OTLP_HEADERS` / `OPENCODE_OTLP_HEADERS_HELPER` | Prefer `{env:VAR}` substitution over inline secrets |
+| `resourceAttributes` / `spanAttributes` | `OPENCODE_RESOURCE_ATTRIBUTES` / `OPENCODE_SPAN_ATTRIBUTES` | |
+| `traceparent` / `tracestate` | `OPENCODE_TRACEPARENT` / `OPENCODE_TRACESTATE` | |
+| `metricsTemporality` | `OPENCODE_OTLP_METRICS_TEMPORALITY` | |
+| `disabledMetrics` / `disabledTraces` / `tracePropagationProviders` | matching `OPENCODE_*` | Arrays, not comma strings |
+| `semconv` | `OPENCODE_SEMCONV` | |
 
-| Option | Environment variable |
-|--------|----------------------|
-| `enabled` | `OPENCODE_ENABLE_TELEMETRY` |
-| `logsEnabled` | `OPENCODE_DISABLE_LOGS` (inverted) |
-| `capturePromptInLogs` | `OPENCODE_CAPTURE_PROMPT_IN_LOGS` |
-| `captureToolFacts` | `OPENCODE_CAPTURE_TOOL_FACTS` |
-| `captureModelContext` | `OPENCODE_CAPTURE_MODEL_CONTEXT` |
-| `emitRedundantEvents` | `OPENCODE_EMIT_REDUNDANT_EVENTS` (inverted: `false` suppresses) |
-| `logLevel` | *(none — option only)*: `debug`, `info`, `warn`, `error` |
-| `endpoint` | `OPENCODE_OTLP_ENDPOINT` |
-| `protocol` | `OPENCODE_OTLP_PROTOCOL` |
-| `metricsInterval` | `OPENCODE_OTLP_METRICS_INTERVAL` |
-| `logsInterval` | `OPENCODE_OTLP_LOGS_INTERVAL` |
-| `metricPrefix` | `OPENCODE_METRIC_PREFIX` |
-| `otlpHeaders` | `OPENCODE_OTLP_HEADERS` |
-| `otlpHeadersHelper` | `OPENCODE_OTLP_HEADERS_HELPER` |
-| `resourceAttributes` | `OPENCODE_RESOURCE_ATTRIBUTES` |
-| `spanAttributes` | `OPENCODE_SPAN_ATTRIBUTES` |
-| `traceparent` | `OPENCODE_TRACEPARENT` |
-| `tracestate` | `OPENCODE_TRACESTATE` |
-| `metricsTemporality` | `OPENCODE_OTLP_METRICS_TEMPORALITY` |
-| `disabledMetrics` | `OPENCODE_DISABLE_METRICS` (array, not a comma string) |
-| `disabledTraces` | `OPENCODE_DISABLE_TRACES` (array, not a comma string) |
-| `tracePropagationProviders` | `OPENCODE_TRACE_PROPAGATION_PROVIDERS` (array, not a comma string) |
-| `semconv` | `OPENCODE_SEMCONV` |
+> `opencode.json` is often committed to version control. Keep secrets in an environment variable or an opencode `{env:VAR}` substitution (for example `"otlpHeaders": "{env:OTEL_HEADERS}"`).
 
-> **Security note:** `opencode.json` is frequently committed to version control. Keep secrets such as `otlpHeaders` in an environment variable or an opencode `{env:VAR}` substitution (e.g. `"otlpHeaders": "{env:OTEL_HEADERS}"`) rather than inline.
+### Guard configuration
+
+| Option | Environment variable | Default | Description |
+|--------|----------------------|---------|-------------|
+| `guardEnabled` | `OPENCODE_GUARD_ENABLED` | `false` | Master switch |
+| `guardMode` | `OPENCODE_GUARD_MODE` | policy → `monitor_only` | `monitor_only` (shadow) or `enforce` |
+| `guardFailMode` | `OPENCODE_GUARD_FAIL_MODE` | policy → `fail_open` | `fail_open` or `fail_closed` on internal error |
+| `guardPolicyPath` | `OPENCODE_GUARD_POLICY_PATH` | `~/.config/opencode/otel-guard-policy.json` | Policy JSON |
+| `guardEmitUnmatched` | `OPENCODE_GUARD_EMIT_UNMATCHED` | `true` | Emit `passthrough` events for unmatched evaluations |
+| `guardAuditEnabled` | `OPENCODE_GUARD_AUDIT_ENABLED` | `false` | Hash-chained decision audit |
+| `guardAuditPath` | `OPENCODE_GUARD_AUDIT_PATH` | `~/.config/opencode/otel-guard-audit.json` | Audit chain path |
+| `guardPromptDefense` | `OPENCODE_GUARD_PROMPT_DEFENSE` | `false` | Score system-prompt defense coverage (advisory) |
+| `guardPromptDefenseMinGrade` | `OPENCODE_GUARD_PROMPT_DEFENSE_MIN_GRADE` | `B` | Grade threshold for the WARN log |
+| `guardPromptDefenseInjectContext` | `OPENCODE_GUARD_PROMPT_DEFENSE_INJECT` | `false` | Append 10 governance lines to the system prompt |
+| `guardToolHooks` | `OPENCODE_GUARD_TOOL_HOOKS` | `false` | Register `execute.before`/`after`: staging, allowlist, redaction, error audit |
+| `guardToolAllowlistPath` | `OPENCODE_GUARD_TOOL_ALLOWLIST_PATH` | `~/.config/opencode/otel-guard-tool-allowlist.json` | Positive allowlist JSON (passive when absent) |
+| `guardToolRedact` | `OPENCODE_GUARD_TOOL_REDACT` | `false` | Redact known credentials from tool output in enforce mode |
+| `guardPromptInjectionBlock` | `OPENCODE_GUARD_PROMPT_INJECTION_BLOCK` | `false` | Scan and optionally block user-prompt injection |
+| `guardPromptInjectionMinSeverity` | `OPENCODE_GUARD_PROMPT_INJECTION_MIN_SEVERITY` | `high` | `critical`, `high`, or `medium` |
+
+Three values are **env-only** and cannot be set through plugin options, so tool arguments or model output cannot forge an identity: `OPENCODE_GUARD_PRINCIPAL_SUB`, `OPENCODE_GUARD_PRINCIPAL_ISS`, and `OPENCODE_GUARD_AUDIT_HMAC_KEY` (≥32 bytes; a short key disables the audit chain).
 
 ### Quick start
 
@@ -285,29 +478,34 @@ export OPENCODE_OTLP_PROTOCOL=grpc
 opencode
 ```
 
-Always set `OPENCODE_OTLP_ENDPOINT` to a full URL with a scheme. Scheme-less values like `localhost:4317` are rejected.
+To enable the guard in shadow mode on top of telemetry:
 
-For `OPENCODE_OTLP_PROTOCOL=http/protobuf` or `OPENCODE_OTLP_PROTOCOL=http/json`, set `OPENCODE_OTLP_ENDPOINT` to the collector base URL rather than a per-signal path. The plugin expands it to `/v1/traces`, `/v1/metrics`, and `/v1/logs` automatically.
+```json
+{
+  "plugins": [
+    {
+      "package": "@chenryn/opencode-plugin-otel",
+      "options": {
+        "enabled": true,
+        "guardEnabled": true,
+        "guardPolicyPath": "./otel-guard-policy.json"
+      }
+    }
+  ]
+}
+```
+
+Move `guardMode` to `enforce` only after reviewing `policy.decision` events under `monitor_only`.
 
 ### Headers and resource attributes
 
 ```bash
-# Auth token for a managed collector (e.g. Honeycomb, Grafana Cloud)
 export OPENCODE_OTLP_HEADERS="x-honeycomb-team=your-api-key,x-honeycomb-dataset=opencode"
-
-# Tag every metric and log with deployment context
 export OPENCODE_RESOURCE_ATTRIBUTES="service.version=1.2.3,deployment.environment=production"
-
-# Tag every span, log event, and metric point with filterable attributes
 export OPENCODE_SPAN_ATTRIBUTES="team=platform,deployment.environment=production"
 ```
 
-> **Security note:** `OPENCODE_OTLP_HEADERS` typically contains auth tokens. Set it in your shell profile (`~/.zshrc`, `~/.bashrc`) or a secrets manager — never commit it to version control or print it in CI logs.
-
-`OPENCODE_RESOURCE_ATTRIBUTES` and `OPENCODE_SPAN_ATTRIBUTES` are independent:
-
-- Use `OPENCODE_RESOURCE_ATTRIBUTES` for producer metadata on the OTel Resource.
-- Use `OPENCODE_SPAN_ATTRIBUTES` for attributes that need to appear on each span, log event, and metric data point for filtering or grouping in backends.
+`OPENCODE_RESOURCE_ATTRIBUTES` sets producer metadata on the OTel Resource; `OPENCODE_SPAN_ATTRIBUTES` adds filterable attributes to every span, log, and metric point. They are independent.
 
 ### Host and deployment identity
 
@@ -319,42 +517,27 @@ export OPENCODE_RESOURCE_ATTRIBUTES="host.name=build-07,service.instance.id=open
 
 | Dimension | Recommended key | Notes |
 |-----------|-----------------|-------|
-| Host | `host.name` | Written explicitly by the deployer. The plugin does not guess it: inside containers the OS hostname is often meaningless or duplicated. |
-| Instance | `service.instance.id` | Unique per process, so several opencode instances on one host stay distinguishable. |
-| Environment | `deployment.environment.name` | Current semantic-convention name. Older backends still accept `deployment.environment`. |
-| Namespace | `service.namespace` | Team or tenant deployment dimension. |
+| Host | `host.name` | Set explicitly by the deployer; the plugin does not guess it |
+| Instance | `service.instance.id` | Unique per process |
+| Environment | `deployment.environment.name` | Older backends accept `deployment.environment` |
+| Namespace | `service.namespace` | Team or tenant dimension |
 
-Two rules to keep identity honest:
-
-- `project.id` is a **workspace** dimension the plugin derives from the observed session. It is not a user identity — do not alias it to `user.id` or `tenant.id`.
-- This plugin never infers user identity. Map source IPs to users in the Collector (for example a `resource` processor) and inject `user.id` there.
-
-Because `resourceAttributes` participates in the process-wide configuration fingerprint, every plugin instance in one process must use the same resource attributes; a conflict fails setup instead of exporting one location's data with another location's identity.
+`project.id` is a workspace dimension derived from the observed session — not a user identity. The plugin never infers user identity; map source IPs to users in the Collector.
 
 ### Dynamic headers
 
-Use `OPENCODE_OTLP_HEADERS_HELPER` when your collector requires short-lived authentication tokens. When this is set, the plugin prewarms the helper once during startup so the first export can use fresh credentials. If a later OTLP export fails with an authentication error (`401`/`403` for HTTP or `UNAUTHENTICATED`/`PERMISSION_DENIED` for gRPC), the plugin refreshes headers again, rebuilds the exporter, and retries the failed export once.
-
-```bash
-export OPENCODE_OTLP_HEADERS_HELPER=/path/to/opencode-otel-headers.sh
-```
-
-Use an absolute helper path. If you need the path to follow the current project, `OPENCODE_OTLP_HEADERS_HELPER` also supports `${PROJECT_ROOT}`, `${WORKTREE}`, and `${DIRECTORY}` placeholders.
+`OPENCODE_OTLP_HEADERS_HELPER` points to an executable that prints dynamic headers as JSON. The plugin prewarms it at startup and refreshes headers on an auth failure (`401`/`403`, or `UNAUTHENTICATED`/`PERMISSION_DENIED`), rebuilding the exporter and retrying once. Helper headers override static headers of the same name; header values are never logged.
 
 ```bash
 export OPENCODE_OTLP_HEADERS_HELPER='${PROJECT_ROOT}/scripts/opencode-otel-headers.sh'
 ```
 
-The helper must be executable and print a JSON object to stdout:
+Placeholders `${PROJECT_ROOT}`, `${WORKTREE}`, and `${DIRECTORY}` are expanded. The helper must print a JSON object, for example:
 
-```bash
+```sh
 #!/bin/sh
-printf '{"Authorization":"Bearer %s"}' "$(get-token.sh)"
+printf '{"Authorization":"Bearer %s"}' "$(gcloud auth print-identity-token)"
 ```
-
-For a Cloud Run collector using IAM authentication, `get-token.sh` might be `gcloud auth print-identity-token`.
-
-If `OPENCODE_OTLP_HEADERS` is also set, helper-provided headers override static headers with the same name. Header values are never logged.
 
 ### Model-visible context capture
 
@@ -362,198 +545,137 @@ If `OPENCODE_OTLP_HEADERS` is also set, helper-provided headers override static 
 export OPENCODE_CAPTURE_MODEL_CONTEXT=1
 ```
 
-When enabled, `session.hook("context")` captures up to two system parts and the last twelve
-messages, retaining only text parts and truncating each to 1,000 characters. The matching primary
-LLM span receives this preview in `llm.input_messages` and its latest user text in `input.value`
-(under [`OPENCODE_SEMCONV=gen_ai`](#semantic-conventions-opencode_semconv) it goes to
-`gen_ai.input.messages` instead, and the same flag also gates the output and tool content
-attributes, which the GenAI conventions mark as Opt-In).
-Media bytes and structured tool payloads are excluded. The hook observes context at its position
-in plugin order; subsequent plugins can still change the request. This is independent of
-`OPENCODE_CAPTURE_PROMPT_IN_LOGS` and can include secrets or PII from previous messages,
-system instructions, or tool text. Use it only with a trusted collector.
+Captures up to two system parts and the last twelve messages, text only, each truncated to 1,000 characters, into the matching primary LLM span (`llm.input_messages`, with the latest user text also in `input.value`). Under `OPENCODE_SEMCONV=gen_ai`, the same flag also gates every content-bearing GenAI attribute that the conventions mark Opt-In (`gen_ai.input.messages`, `gen_ai.output.messages`, `gen_ai.tool.call.arguments`, `gen_ai.tool.call.result`, and the `prompt` log attribute). Media bytes and structured tool payloads are never copied. The hook observes context at its position in plugin order; later plugins can still change the request. Use only with a trusted collector.
 
 ### LLM trace propagation
-
-Use `OPENCODE_TRACE_PROPAGATION_PROVIDERS` to connect this plugin's LLM spans to spans emitted by an LLM gateway such as LiteLLM or vLLM. For matching provider IDs, the plugin injects the current `opencode.llm` span as the W3C `traceparent` header and includes `tracestate` when present.
-
-Propagation is limited to primary agent-loop requests whose provider, model, and agent match the active LLM step; title, compaction, and transient generation requests are not parented to that step.
 
 ```bash
 export OPENCODE_TRACE_PROPAGATION_PROVIDERS="company-litellm,vllm"
 ```
 
-The values are opencode provider IDs, including custom names configured under the `provider` key in `opencode.json`. Propagation is disabled when the setting is unset. Use `*` only when every configured provider should receive trace context.
+For matching provider IDs, the plugin injects the active LLM span as W3C `traceparent` (and `tracestate` when present) so traces join spans emitted by an LLM gateway. Propagation is limited to primary agent-loop requests whose provider, model, and agent match the active step; title, compaction, and transient generations are not parented. Values are OpenCode provider IDs; `*` enables all providers. Only W3C trace context is injected — no arbitrary headers or baggage. For WebSocket-backed providers, the plugin also injects on the experimental `experimental.ws.handshake` hook; enabling it can reopen reused sockets, so verify against your provider.
 
-Only W3C trace context is propagated. The plugin does not inject arbitrary headers or W3C baggage. Configure static provider-specific headers through the provider's native `options.headers` setting in `opencode.json`.
+### Semantic conventions
 
-For WebSocket-backed providers, the plugin also injects into V2's experimental
-`experimental.ws.handshake` hook. Changing trace headers per step can reopen a reused socket,
-so enable propagation only for providers where connected traces outweigh connection reuse.
-The hook is experimental and should be verified against your provider's WebSocket route.
-
-### Semantic conventions (`OPENCODE_SEMCONV`)
-
-Every signal is emitted in one of two wire dialects, selected by `OPENCODE_SEMCONV` (or the `semconv` plugin option). The default, `openinference`, is the format this plugin has always produced and the one existing dashboards query. Setting `gen_ai` switches spans, metrics, and log events to the [OpenTelemetry GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/), so GenAI-native backends (Datadog, Splunk Agent Observability, Dynatrace, SigNoz, Grafana, Langfuse, Phoenix) recognize span types, usage, and events without an external collector transform.
-
-```bash
-export OPENCODE_SEMCONV=gen_ai
-```
+`OPENCODE_SEMCONV` (or `semconv`) selects the wire dialect for spans, metrics, and log events together. `openinference` is the default and what existing dashboards query; `gen_ai` targets GenAI-native backends. Aliases: `open-inference` → `openinference`, `gen-ai`/`genai` → `gen_ai`. An unrecognized value warns and falls back to `openinference`.
 
 | Aspect | `openinference` (default) | `gen_ai` |
 |--------|---------------------------|----------|
-| Run span name | `{prefix}session` | `invoke_agent {agent}` |
-| LLM span name | `{prefix}llm` | `chat {model}` |
-| Tool span name | `{prefix}tool.{tool}` | `execute_tool {tool}` |
-| Span type | `openinference.span.kind` = `AGENT` / `LLM` / `TOOL` | `gen_ai.operation.name` = `invoke_agent` / `chat` / `execute_tool` |
-| Session | `session.id` | `gen_ai.conversation.id` (plus `session.id`) |
-| Agent | `agent.name` | `gen_ai.agent.name` |
-| Model | `llm.model_name` | `gen_ai.request.model`, `gen_ai.response.model` |
-| Provider | `llm.provider`, `llm.system` | `gen_ai.provider.name`, canonicalized (`amazon-bedrock` → `aws.bedrock`) |
-| Input | `input.value`, `input.mime_type`, `llm.input_messages` as `[{role, content}]` | `gen_ai.input.messages` as `[{role, parts:[{type:"text", content}]}]` |
-| Output | `output.value`, `output.mime_type`, `llm.output_messages` | `gen_ai.output.messages` |
-| Token usage | `llm.token_count.prompt` / `.completion` / `.total`, `llm.token_count.prompt_details.cache_read` / `.cache_write` | `gen_ai.usage.input_tokens` (prompt + cache read + cache write), `gen_ai.usage.output_tokens` (completion + reasoning), `gen_ai.usage.cache_read.input_tokens`, `gen_ai.usage.cache_creation.input_tokens` |
+| Identity | `session.id`, `agent.name`, `llm.model_name` / `llm.provider` | `gen_ai.conversation.id` (+ `session.id`), `gen_ai.agent.name`, `gen_ai.request.model` / `gen_ai.response.model`, `gen_ai.provider.name` |
+| Input | `input.value`, `llm.input_messages` as `[{role, content}]` | `gen_ai.input.messages` as `[{role, parts:[{type:"text", content}]}]` |
+| Output | `output.value`, `llm.output_messages` | `gen_ai.output.messages` |
+| Tokens | `llm.token_count.prompt` / `.completion` / `.total`, plus cache details | `gen_ai.usage.input_tokens` (prompt + cache), `.output_tokens` (completion + reasoning), separate cache/read counters, `gen_ai.token.modality` |
 | Finish reason | `llm.finish_reason` (string) | `gen_ai.response.finish_reasons` (array) |
-| Failure | span status + `llm.finish_reason` + `error.type` / `error.message` / `error.status` | span status + `error.type` / `error.message` / `error.status` |
 | Cost | `llm.cost.total`, `cost_usd` | `gen_ai.usage.cost`, `session.total_cost_usd` |
-| Turn / step | — | `gen_ai.turn.id`, `gen_ai.step.id` (extensions) |
 | Tool call | `tool.id`, `tool.name`, `tool.parameters` | `gen_ai.tool.call.id`, `gen_ai.tool.name`, `gen_ai.tool.type`, `gen_ai.tool.call.arguments`, `gen_ai.tool.call.result` |
-| Time to first token | `gen_ai.server.time_to_first_token` (s) and `llm.time_to_first_token_ms` | `gen_ai.server.time_to_first_token` (s) |
-| Token metric | `{prefix}token.usage` counter, `type=input` / `output` / `reasoning` / `cacheRead` / `cacheCreation` | five `gen_ai.client.inference.usage.*` counters, split by token category and tagged `gen_ai.token.modality` |
-| Latency metric | `{prefix}tool.duration` only | adds `gen_ai.client.inference.duration` (s) per LLM request and `gen_ai.execute_tool.duration` (s) per tool call |
-| Log events | all ten events | all ten events; set `OPENCODE_EMIT_REDUNDANT_EVENTS=0` to drop `session.created`, `api_request`, `api_error`, `tool_result` |
-| Log/metric identity | `session.id`, `model`, `provider`, `agent`, `tool_name` | `gen_ai.conversation.id`, `gen_ai.request.model`, `gen_ai.provider.name`, `gen_ai.agent.name`, `gen_ai.tool.name` (plus `session.id`) |
+| Correlation | — | `gen_ai.turn.id` and `gen_ai.step.id` (plugin extensions) |
+| Errors | span status + `llm.finish_reason` + `error.type` / `.message` / `.status` | span status + `error.type` / `.message` / `.status` |
 
-Notes:
+`gen_ai.token.modality` is `text` for output tokens and `unknown` for prompt/cache tokens, because OpenCode receives one aggregate prompt count. Turn ids are `<sessionID>:<sequence>`, strictly increasing per session; a tool span carries the same turn id plus the owning assistant message id as `gen_ai.step.id`. OpenCode-specific attributes (`agent.type`, `session.is_subagent`, `parent_session_id`, `parent_tool_call_id`, retry fields, session totals, `tool.success`, `tool.error`, `tool.result_size_bytes`, error fields, subagent agent, and anything from `OPENCODE_SPAN_ATTRIBUTES`) are emitted in both dialects.
 
-- **The GenAI metric names track the current `semantic-conventions-genai` revision, not the 1.40 release.** That revision replaced the `gen_ai.client.token.usage` histogram and `gen_ai.client.operation.duration` with one monotonic counter per token category (`gen_ai.client.inference.usage.*`) plus `gen_ai.client.inference.duration`, and added `gen_ai.execute_tool.duration`. A backend dashboard written against the 1.40 names needs a rename or a collector transform.
-- **Token counters carry `gen_ai.token.modality`.** Generated tokens are `text`; prompt, cache-read, and cache-write tokens are `unknown`, because opencode receives a single aggregate prompt count and the text/image/audio split cannot be recovered. The conventions require `unknown` rather than a guess when the split is unavailable, so per-modality ratios are only meaningful once a provider reports them.
+### Disabling signals
 
-- **The whole signal set switches together.** Spans, metric names, and log-event attributes all follow `OPENCODE_SEMCONV`, so a GenAI-native backend needs no translation layer. `OPENCODE_METRIC_PREFIX` does not apply to the `gen_ai.*` metrics, because a prefixed name would no longer match the convention.
-- **Turn and step correlation.** Every run span carries `gen_ai.turn.id` (`<sessionID>:<sequence>`, strictly increasing per session) and every LLM/tool span carries the same turn id plus `gen_ai.step.id` (the assistant message id of the owning step). Backends that merge sessions therefore never see a colliding turn number, and a tool call can be joined back to its step and turn without a span tree. These two keys are plugin extensions with no official constant; the `openinference` flavor omits them.
-- **Cost.** The `gen_ai` flavor reports per-request cost as the extension key `gen_ai.usage.cost` and session totals as `session.total_cost_usd`; the `openinference` flavor keeps `llm.cost.total` and `cost_usd`. Do not sum two of them for the same scope.
-- **Structured errors.** `error.type` is taken from the structured error payload (`{type, message, status}`) and only falls back to the finish reason when none was reported, so negative-sample rules can group on a stable type. `error.message` and `error.status` are preserved alongside it.
-- **Content attributes are Opt-In in the GenAI conventions**, so under `gen_ai` they follow `OPENCODE_CAPTURE_MODEL_CONTEXT` instead of always being on: `gen_ai.input.messages`, `gen_ai.output.messages`, `gen_ai.tool.call.arguments`, `gen_ai.tool.call.result`, and the `prompt` attribute of `user_prompt`. Everything else — span names, operation names, identity, usage, finish reasons — is emitted regardless.
-- **Retry and subtask correlation.** Each durable `session.retry.scheduled` event increments the retry counter (with `retry.attempt` and the structured `error.type`) and stamps the current run span with `session.retry.count`, `retry.attempt`, and the error fields; the per-execution count resets when the next execution starts, so retries never add to normal calls. Subagent runs carry `parent_session_id` plus `parent_tool_call_id` when the dispatch is correlated, which lets a backend split subtask volume by parent session while `subtask.count` still counts each child session once.
-- **opencode-specific attributes are emitted in both dialects**, because the conventions do not model them: `agent.type`, `session.is_subagent`, `parent_session_id`, `parent_tool_call_id`, `session.retry.count`, `retry.attempt`, `session.total_tokens`, `session.total_cost_usd`, `session.total_messages`, `duration_ms`, `tool.success`, `tool.error`, `tool.result_size_bytes`, `tool.provider_executed`, `error.type`, `error.message`, `error.status`, `subagent.agent`, plus anything from `OPENCODE_SPAN_ATTRIBUTES`.
-- **`gen_ai.usage.input_tokens` includes cache tokens**, matching how OpenAI reports `prompt_tokens`. Cache reads and writes are also broken out separately.
-- An unrecognized value is logged as a warning and ignored; the plugin falls back to `openinference`.
-- Only text parts are serialized into message attributes. Media and structured tool payloads are never copied into spans.
-
-### Disabling specific metrics
-
-Use `OPENCODE_DISABLE_METRICS` to suppress individual metrics. The value is a comma-separated list of metric name suffixes (without the prefix).
-
-Disabling a metric only stops the counter/histogram from being incremented — the corresponding log events are still emitted.
-
-Under [`OPENCODE_SEMCONV=gen_ai`](#semantic-conventions-opencode_semconv) the GenAI metrics have no prefix, so list
-them by full name (`OPENCODE_DISABLE_METRICS="gen_ai.client.inference.usage.input_tokens,gen_ai.client.inference.duration"`).
+`OPENCODE_DISABLE_METRICS` takes comma-separated metric suffixes without the prefix; disabling a metric stops increments but leaves its log events intact. Under `gen_ai`, list GenAI metrics by full name.
 
 ```bash
-# Disable a single metric
-export OPENCODE_DISABLE_METRICS="retry.count"
-
-# Disable multiple metrics
-export OPENCODE_DISABLE_METRICS="cache.count,session.duration,session.token.total,session.cost.total,model.usage,retry.count,message.count,exporter.export.failures,exporter.auth.retry.count,event.dispatch.errors,flush.failures,flush.duration"
-```
-
-#### opencode-only metrics
-
-The following metrics are specific to opencode and have no equivalent in Claude Code's built-in monitoring. If you are using a Claude Code dashboard and want to avoid cluttering it with opencode-only metrics, you can disable them:
-
-```bash
-export OPENCODE_DISABLE_METRICS="cache.count,session.duration,session.token.total,session.cost.total,model.usage,retry.count,message.count,exporter.export.failures,exporter.auth.retry.count,event.dispatch.errors,flush.failures,flush.duration"
-```
-
-| Metric suffix | Why it's opencode-only |
-|---------------|------------------------|
-| `cache.count` | Tracks cache read/write activity as occurrence counts — not a Claude Code signal |
-| `session.duration` | Session wall-clock duration — not emitted by Claude Code |
-| `session.token.total` | Per-session token histogram — not emitted by Claude Code |
-| `session.cost.total` | Per-session cost histogram — not emitted by Claude Code |
-| `model.usage` | Per-model message counter — not emitted by Claude Code |
-| `retry.count` | API retry counter — not emitted by Claude Code |
-| `message.count` | Completed message counter — not emitted by Claude Code |
-| `exporter.*` | OTLP export health counters — plugin diagnostics |
-| `event.dispatch.errors` | Event dispatch failures — plugin diagnostics |
-| `flush.*` | Scheduled flush failures and duration — plugin diagnostics |
-
-### Disabling OTLP logs
-
-Use `OPENCODE_DISABLE_LOGS` to suppress every OTLP log event emitted by the plugin.
-
-```bash
+export OPENCODE_DISABLE_METRICS="cache.count,session.duration,retry.count"
 export OPENCODE_DISABLE_LOGS=1
-```
-
-This only disables OTLP logs. Metrics and traces continue to be exported unless they are disabled separately.
-
-### Disabling traces
-
-Use `OPENCODE_DISABLE_TRACES` to suppress one or more trace types.
-
-```bash
-# Disable one trace type
-export OPENCODE_DISABLE_TRACES="tool"
-
-# Disable multiple trace types
 export OPENCODE_DISABLE_TRACES="llm,tool"
-
-# Disable every trace type explicitly
-export OPENCODE_DISABLE_TRACES="all"
 ```
 
-Accepted explicit "disable all traces" values are `all`, `*`, `true`, and `1`.
+The following are OpenCode-only and have no Claude Code equivalent, so disable them when using a Claude Code dashboard: `cache.count`, `session.duration`, `session.token.total`, `session.cost.total`, `model.usage`, `retry.count`, `message.count`, `exporter.*`, `event.dispatch.errors`, `flush.*`. For full dashboard compatibility also set `OPENCODE_METRIC_PREFIX=claude_code.`.
 
-### SigNoz example
+### Multi-instance consistency
+
+When several plugin instances load in one process (global plus project config), all **telemetry** options must be identical. A different endpoint, authentication, resource attribute, prefix, or signal option fails setup rather than exporting one location's data with another's settings. The fingerprint covers all telemetry fields with the three set-valued fields sorted; `logLevel` and the entire `guard` config are excluded, so projects may enable different guard features while sharing one OTel SDK. Process-wide shared event processing is serialized for deterministic ordering.
+
+### Backend examples
 
 ```bash
-export OPENCODE_ENABLE_TELEMETRY=1
+# SigNoz
 export OPENCODE_OTLP_ENDPOINT="https://ingest.us.signoz.cloud:443"
-export OPENCODE_OTLP_HEADERS="signoz-ingestion-key=<SIGNOZ_INGESTION_KEY>"
-```
+export OPENCODE_OTLP_HEADERS="signoz-ingestion-key=<KEY>"
 
-> Use `https://ingest.in.signoz.cloud:443` for India, `https://ingest.eu2.signoz.cloud:443` for EU2, etc.
-> See [SigNoz setup docs](https://signoz.io/docs/cloud/) for all regions.
-
-### Datadog example
-
-```bash
-export OPENCODE_ENABLE_TELEMETRY=1
+# Datadog (delta temporality is required)
 export OPENCODE_OTLP_ENDPOINT=https://otlp.datadoghq.com
 export OPENCODE_OTLP_PROTOCOL=http/protobuf
-export OPENCODE_OTLP_HEADERS="dd-api-key=YOUR_DATADOG_API_KEY"
-
-# Required — Datadog's OTLP intake only accepts delta temporality
+export OPENCODE_OTLP_HEADERS="dd-api-key=<KEY>"
 export OPENCODE_OTLP_METRICS_TEMPORALITY=delta
-```
 
-> **Note:** The endpoint is `otlp.datadoghq.com` (not `api.datadoghq.com`).
-> Use `otlp.datadoghq.eu` for EU, `otlp.us3.datadoghq.com` for US3, etc.
-> See [Datadog OTLP docs](https://docs.datadoghq.com/opentelemetry/setup/otlp_ingest_in_the_agent/) for all regions.
-
-### Honeycomb example
-
-```bash
-export OPENCODE_ENABLE_TELEMETRY=1
+# Honeycomb
 export OPENCODE_OTLP_ENDPOINT=https://api.honeycomb.io
 export OPENCODE_OTLP_PROTOCOL=http/protobuf
-```
 
-### Grafana Cloud example
-
-```bash
-export OPENCODE_ENABLE_TELEMETRY=1
+# Grafana Cloud
 export OPENCODE_OTLP_ENDPOINT=https://otlp-gateway-prod-us-central-0.grafana.net/otlp
 export OPENCODE_OTLP_PROTOCOL=http/protobuf
 export OPENCODE_OTLP_HEADERS="Authorization=Basic <base64-instance-id:api-key>"
 ```
 
-### Claude Code dashboard compatibility
+## Installation
+
+Install from GitHub (no npm account needed). Add this to `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": ["github:chenryn/opencode-plugin-otel"]
+}
+```
+
+OpenCode installs the package on first start and reloads it on config changes. Other
+valid targets are a branch, tag, full commit hash, or a subdirectory selector:
+
+```json
+{
+  "plugins": [
+    "github:chenryn/opencode-plugin-otel#main",
+    "git+ssh://git@github.com/chenryn/opencode-plugin-otel.git#main"
+  ]
+}
+```
+
+You can also install and update it with the CLI:
 
 ```bash
-export OPENCODE_METRIC_PREFIX=claude_code.
+opencode plugin add github:chenryn/opencode-plugin-otel
+opencode plugin list
+opencode plugin update github:chenryn/opencode-plugin-otel
 ```
+
+To pass options, use the object form (the `package` field is the npm name declared in
+`package.json`; OpenCode resolves it to the same plugin regardless of how it was installed):
+
+```json
+{
+  "plugins": [
+    {
+      "package": "@chenryn/opencode-plugin-otel",
+      "options": { "enabled": true, "guardEnabled": true }
+    }
+  ]
+}
+```
+
+The plugin's runtime **ID** is `chenryn.otel` — use it to disable or re-enable the plugin
+with the `plugins` control syntax (`"-chenryn.otel"`, `"chenryn.*"`). If you also have a
+fork with a different ID, keep them distinct to avoid OpenCode's duplicate-ID error.
+
+Once `@chenryn/opencode-plugin-otel` is published to npm, it can be installed by name:
+
+```json
+{
+  "plugins": ["@chenryn/opencode-plugin-otel"]
+}
+```
+
+For local development, install dependencies with `bun install` and create `.opencode/plugins/otel/index.ts` in the project where OpenCode runs:
+
+```ts
+export { default } from "/path/to/opencode-plugin-otel/src/index.ts"
+```
+
+OpenCode V2 discovers this directory automatically. On OpenCode `2.0.1`, a `plugins` entry pointing directly to an absolute `.ts` file is rejected — the package loader expects a directory.
 
 ## Local development
 
@@ -561,19 +683,12 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md).
 
 ## GitHub Discord notifications
 
-This repo includes a reusable workflow at `.github/workflows/discord-notify.yml` that posts a Discord embed for supported GitHub events. The included `.github/workflows/discord-events.yml` file wires it up for:
+This repo includes a reusable workflow at `.github/workflows/discord-notify.yml` that posts a Discord embed for `issues.opened`, `pull_request.opened`, and `release.published`. Set a repository or org secret named `DISCORD_WEBHOOK` to enable it.
 
-- `issues.opened`
-- `pull_request.opened`
-- `release.published`
-
-Set an org or repo secret named `DISCORD_WEBHOOK` and the workflow will post to that webhook automatically.
-
-To reuse it from another repository in the `DEVtheOPS` org:
+To reuse it from another repository under the same account:
 
 ```yaml
 name: Discord Events
-
 on:
   issues:
     types: [opened]
@@ -581,22 +696,15 @@ on:
     types: [opened]
   release:
     types: [published]
-
 jobs:
   notify-discord:
-    uses: DEVtheOPS/opencode-plugin-otel/.github/workflows/discord-notify.yml@main
+    uses: chenryn/opencode-plugin-otel/.github/workflows/discord-notify.yml@main
     with:
-      username: DEVtheOPS Bot
-      title_prefix: "[DEVtheOPS]"
+      username: chenryn Bot
+      title_prefix: "[chenryn]"
       include_body: true
     secrets:
       discord_webhook: ${{ secrets.DISCORD_WEBHOOK }}
 ```
 
-Available workflow inputs:
-
-- `username`: webhook display name
-- `avatar_url`: webhook avatar image URL
-- `title_prefix`: optional title prefix for the embed
-- `include_body`: include the issue, PR, or release body in the card
-- `color`: fallback embed color for unsupported events
+Workflow inputs: `username`, `avatar_url`, `title_prefix`, `include_body`, and `color`.

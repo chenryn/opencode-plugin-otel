@@ -8,7 +8,7 @@
 ## Getting started
 
 ```bash
-git clone https://github.com/devtheops/opencode-plugin-otel
+git clone https://github.com/chenryn/opencode-plugin-otel
 cd opencode-plugin-otel
 bun install
 ```

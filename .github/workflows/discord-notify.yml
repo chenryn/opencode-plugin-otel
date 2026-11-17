@@ -6,7 +6,7 @@ on:
       username:
         description: Discord webhook username
         required: false
-        default: DEVtheOPS Bot
+        default: chenryn Bot
         type: string
       avatar_url:
         description: Discord webhook avatar URL
@@ -122,7 +122,7 @@ jobs:
             }
 
             const payload = {
-              username: process.env.DISCORD_USERNAME || "DEVtheOPS Bot",
+              username: process.env.DISCORD_USERNAME || "chenryn Bot",
               avatar_url: process.env.DISCORD_AVATAR_URL || "https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png",
               embeds: [
                 {

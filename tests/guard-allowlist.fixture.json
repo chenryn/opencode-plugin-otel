@@ -1,0 +1,11 @@
+{
+  "version": "test-fixture",
+  "tools": {
+    "bash": {
+      "command_prefixes": ["echo ", "pwd"]
+    },
+    "webfetch": {
+      "url_prefixes": ["https://example.com/"]
+    }
+  }
+}

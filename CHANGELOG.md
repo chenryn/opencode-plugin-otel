@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+> **Fork notice:** This repository is maintained at `chenryn/opencode-plugin-otel`.
+> Starting with the fork, the plugin ID is `chenryn.otel` and the npm package name is
+> `@chenryn/opencode-plugin-otel` (previously `devtheops.otel` / `@devtheops/opencode-plugin-otel`).
+> Older entries below retain the original DEVtheOPS URLs as historical record.
+
 ---
 
 ## [2.0.1](https://github.com/DEVtheOPS/opencode-plugin-otel/compare/v2.0.0...v2.0.1) (2026-10-06)

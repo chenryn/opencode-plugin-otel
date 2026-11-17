@@ -1,0 +1,8 @@
+{
+  "version": "test-fixture-1",
+  "settings": { "mode": "monitor_only", "fail_mode": "fail_open" },
+  "rules": [
+    { "id": "deny-rm", "name": "rm rf", "type": "deny", "severity": "high", "tools": ["shell"], "match": { "command_regex": "rm\\s+-rf" } },
+    { "id": "allow-ls", "name": "ls ok", "type": "allow", "tools": ["shell"], "match": { "command_regex": "^ls\\b" } }
+  ]
+}

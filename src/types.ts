@@ -103,6 +103,10 @@ export type Instruments = {
   flushFailureCounter: Counter
   /** `{prefix}flush.duration`; one record per scheduled flush. */
   flushDurationHistogram: Histogram
+  /** `{prefix}guard.decisions`; one increment per permission.evaluate guard decision. */
+  guardDecisionsCounter: Counter
+  /** `{prefix}guard.tool.actions`; tool before/after guard actions (staged/allowlist/redacted/tool_error). */
+  guardToolActionsCounter: Counter
 }
 
 /** Session role emitted by opencode: either the primary/root agent or a spawned subagent. */

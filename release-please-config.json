@@ -39,7 +39,7 @@
           "type": "chore"
         }
       ],
-      "package-name": "@devtheops/opencode-plugin-otel",
+      "package-name": "@chenryn/opencode-plugin-otel",
       "release-type": "node"
     }
   }

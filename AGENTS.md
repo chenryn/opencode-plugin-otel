@@ -21,7 +21,7 @@ bun test
 ## Target runtime
 
 `main` targets **OpenCode V2** (`>=2`) and exports a `Plugin.define`-style default export
-(`id: "devtheops.otel"`, `setup`). The OpenCode V1 plugin lives on the `v1` branch and is
+(`id: "chenryn.otel"`, `setup`). The OpenCode V1 plugin lives on the `v1` branch and is
 released from the `1.x` line; do not add V1 compatibility shims to `main`.
 
 ## Project layout

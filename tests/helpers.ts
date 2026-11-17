@@ -248,6 +248,8 @@ export function makeCtx(
   const eventDispatchError = makeCounter()
   const flushFailure = makeCounter()
   const flushDuration = makeHistogram()
+  const guardDecisions = makeCounter()
+  const guardToolActions = makeCounter()
   const logger = makeLogger()
   const pluginLog = makePluginLog()
   const tracer = makeTracer()
@@ -279,6 +281,8 @@ export function makeCtx(
     eventDispatchErrorCounter: eventDispatchError as unknown as Counter,
     flushFailureCounter: flushFailure as unknown as Counter,
     flushDurationHistogram: flushDuration as unknown as Histogram,
+    guardDecisionsCounter: guardDecisions as unknown as Counter,
+    guardToolActionsCounter: guardToolActions as unknown as Counter,
   }
 
   const ctx: HandlerContext = {

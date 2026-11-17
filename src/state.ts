@@ -22,6 +22,9 @@ export function configKey(config: PluginConfig): string {
     disabledTraces: [...config.disabledTraces].sort(),
     tracePropagationProviders: [...config.tracePropagationProviders].sort(),
     logLevel: undefined,
+    // guard options never touch the OTel providers/instruments, so instances may
+    // enable the guard per project while sharing one process-wide telemetry SDK
+    guard: undefined,
   })
   return createHash("sha256").update(normalized).digest("hex")
 }

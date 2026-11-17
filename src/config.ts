@@ -1,3 +1,5 @@
+import { homedir } from "node:os"
+import { join } from "node:path"
 import { DEFAULT_SEMCONV, parseSemconv, SEMCONV_VALUES, type SemconvFlavor } from "./semconv.ts"
 import { LEVELS, type Level } from "./types.ts"
 
@@ -6,6 +8,52 @@ export type MetricsTemporality = "cumulative" | "delta" | "lowmemory"
 
 /** Valid trace types emitted by the plugin. */
 export const TRACE_TYPES = ["session", "llm", "tool"] as const
+
+/** Guard operating modes. `monitor_only` shadows (labels `would_denied`); `enforce` mutates effects. */
+export type GuardModeOption = "monitor_only" | "enforce"
+
+/** Guard failure semantics when the decision path itself throws. */
+export type GuardFailModeOption = "fail_open" | "fail_closed"
+
+/** Guard-specific resolved configuration. */
+export type GuardConfig = {
+  /** Master switch: register the `permission.evaluate` decision point. Default `false`. */
+  guardEnabled: boolean
+  /** Overrides the policy file `settings.mode` when provided. */
+  guardMode: GuardModeOption | undefined
+  /** Overrides the policy file `settings.fail_mode` when provided. */
+  guardFailMode: GuardFailModeOption | undefined
+  /** Path to the JSON policy file (S3 rule page export format). */
+  guardPolicyPath: string
+  /** Whether unmatched evaluations still emit a `passthrough` policy.decision event. */
+  guardEmitUnmatched: boolean
+  /** Opt-in hash-chained audit log of decisions. Default `false`. */
+  guardAuditEnabled: boolean
+  /** Path to the hash-chained audit log. */
+  guardAuditPath: string
+  /** Operator-declared principal subject; env-only, never from tool args or model output. */
+  guardPrincipalSub: string | undefined
+  /** Optional principal issuer; env-only. */
+  guardPrincipalIss: string | undefined
+  /** HMAC key for argument digests (>=32 bytes); env-only. */
+  guardAuditHmacKey: string | undefined
+  /** Opt-in prompt defense coverage scoring. Default `false`. */
+  guardPromptDefense: boolean
+  /** Minimum acceptable grade (A/B/C/D/F); reports below this can fail closed. */
+  guardPromptDefenseMinGrade: string
+  /** When true, append the 10 governance context lines to event.system before scoring. Default `false`. */
+  guardPromptDefenseInjectContext: boolean
+  /** Master switch for the `tool.execute.before` / `execute.after` hooks. Default `false`. */
+  guardToolHooks: boolean
+  /** Path to the optional positive command/URL allowlist JSON file. */
+  guardToolAllowlistPath: string
+  /** Redact known credential patterns from tool output before the model sees it. Default `false`. */
+  guardToolRedact: boolean
+  /** Opt-in user-prompt injection blocking on `session.prompt`. Default `false` (advisory scan only when the hook is on). */
+  guardPromptInjectionBlock: boolean
+  /** Minimum injection severity that blocks when `guardPromptInjectionBlock` + enforce. Default `high`. */
+  guardPromptInjectionMinSeverity: "critical" | "high" | "medium"
+}
 
 const VALID_TEMPORALITIES: ReadonlySet<MetricsTemporality> = new Set<MetricsTemporality>(["cumulative", "delta", "lowmemory"])
 const TRACE_DISABLE_ALL_VALUES = new Set(["all", "*", "true", "1"])
@@ -37,6 +85,7 @@ export type PluginConfig = {
   disabledMetrics: Set<string>
   disabledTraces: Set<string>
   tracePropagationProviders: Set<string>
+  guard: GuardConfig
 }
 
 export function parseAttributePairs(raw: string | undefined): Record<string, string> {
@@ -86,6 +135,37 @@ export type OtelPluginOptions = {
   disabledMetrics?: string[]
   disabledTraces?: string[]
   tracePropagationProviders?: string[]
+  /** Enables the otel.guard runtime guard (permission.evaluate decision point). Default `false`. */
+  guardEnabled?: boolean
+  /** Overrides the policy file mode: `monitor_only` (shadow) or `enforce`. */
+  guardMode?: GuardModeOption
+  /** Overrides the policy file fail mode: `fail_open` or `fail_closed`. */
+  guardFailMode?: GuardFailModeOption
+  /** Path to the guard policy JSON file. */
+  guardPolicyPath?: string
+  /** Emit `passthrough` policy.decision events for unmatched evaluations. Default `true`. */
+  guardEmitUnmatched?: boolean
+  /** Enable the hash-chained decision audit log. Default `false`. */
+  guardAuditEnabled?: boolean
+  /** Path to the hash-chained audit log. */
+  guardAuditPath?: string
+  /** Enable prompt defense coverage scoring. Default `false`. */
+  guardPromptDefense?: boolean
+  /** Minimum acceptable grade (A/B/C/D/F). Default `B`. */
+  guardPromptDefenseMinGrade?: string
+  /** Inject the 10 governance context lines into the system prompt before scoring. Default `false`. */
+  guardPromptDefenseInjectContext?: boolean
+  /** Enable the tool.execute.before/after hooks (structured args, output redaction, failure audit). Default `false`. */
+  guardToolHooks?: boolean
+  /** Path to the positive command/URL allowlist JSON file. */
+  guardToolAllowlistPath?: string
+  /** Redact well-known credentials from tool output before it reaches the model. Default `false`. */
+  guardToolRedact?: boolean
+  /** Scan user prompts for injection and (with enforce) block them. Default `false`. */
+  guardPromptInjectionBlock?: boolean
+  /** Minimum injection severity to block: `critical`/`high`/`medium`. Default `high`. */
+  guardPromptInjectionMinSeverity?: "critical" | "high" | "medium"
+  /** Principal subject is env-only (OPENCODE_GUARD_PRINCIPAL_SUB) and intentionally absent here. */
 }
 
 const VALID_PROTOCOLS = new Set<PluginConfig["protocol"]>(["grpc", "http/protobuf", "http/json"])
@@ -117,6 +197,18 @@ function pickMetricsTemporality(value: unknown): MetricsTemporality | undefined 
   if (typeof value !== "string") return undefined
   const normalized = value.toLowerCase()
   return VALID_TEMPORALITIES.has(normalized as MetricsTemporality) ? (normalized as MetricsTemporality) : undefined
+}
+
+function pickGuardMode(value: unknown): GuardModeOption | undefined {
+  return value === "monitor_only" || value === "enforce" ? value : undefined
+}
+
+function pickGuardFailMode(value: unknown): GuardFailModeOption | undefined {
+  return value === "fail_open" || value === "fail_closed" ? value : undefined
+}
+
+function pickInjectionSeverity(value: unknown): "critical" | "high" | "medium" | undefined {
+  return value === "critical" || value === "high" || value === "medium" ? value : undefined
 }
 
 function pickSemconv(value: unknown): SemconvFlavor | undefined {
@@ -237,6 +329,52 @@ export function loadConfig(options: OtelPluginOptions = {}): PluginConfig {
       : splitList(process.env["OPENCODE_TRACE_PROPAGATION_PROVIDERS"]),
   )
 
+  const optionGuardMode = pickGuardMode(resolvedOptions.guardMode) ?? pickGuardMode(process.env["OPENCODE_GUARD_MODE"])
+  const optionGuardFailMode = pickGuardFailMode(resolvedOptions.guardFailMode)
+    ?? pickGuardFailMode(process.env["OPENCODE_GUARD_FAIL_MODE"])
+  const guardPolicyPath = pickString(resolvedOptions.guardPolicyPath)
+    ?? process.env["OPENCODE_GUARD_POLICY_PATH"]
+    ?? join(homedir(), ".config", "opencode", "otel-guard-policy.json")
+  const optionGuardEmitUnmatched = pickBoolean(resolvedOptions.guardEmitUnmatched)
+    ?? readEnvBoolean("OPENCODE_GUARD_EMIT_UNMATCHED", true)
+  const guardAuditEnabled = pickBoolean(resolvedOptions.guardAuditEnabled)
+    ?? hasNonEmptyEnv("OPENCODE_GUARD_AUDIT_ENABLED")
+  const rawMinGrade = (pickString(resolvedOptions.guardPromptDefenseMinGrade)
+    ?? process.env["OPENCODE_GUARD_PROMPT_DEFENSE_MIN_GRADE"] ?? "B").toUpperCase()
+  const guardPromptDefenseMinGrade = ["A", "B", "C", "D", "F"].includes(rawMinGrade) ? rawMinGrade : "B"
+  const guard: GuardConfig = {
+    guardEnabled: pickBoolean(resolvedOptions.guardEnabled) ?? hasNonEmptyEnv("OPENCODE_GUARD_ENABLED"),
+    guardMode: optionGuardMode,
+    guardFailMode: optionGuardFailMode,
+    guardPolicyPath,
+    guardEmitUnmatched: optionGuardEmitUnmatched,
+    guardAuditEnabled,
+    guardAuditPath: pickString(resolvedOptions.guardAuditPath)
+      ?? process.env["OPENCODE_GUARD_AUDIT_PATH"]
+      ?? join(homedir(), ".config", "opencode", "otel-guard-audit.json"),
+    guardPrincipalSub: pickString(process.env["OPENCODE_GUARD_PRINCIPAL_SUB"]),
+    guardPrincipalIss: pickString(process.env["OPENCODE_GUARD_PRINCIPAL_ISS"]),
+    guardAuditHmacKey: pickString(process.env["OPENCODE_GUARD_AUDIT_HMAC_KEY"]),
+    guardPromptDefense: pickBoolean(resolvedOptions.guardPromptDefense)
+      ?? hasNonEmptyEnv("OPENCODE_GUARD_PROMPT_DEFENSE"),
+    guardPromptDefenseMinGrade,
+    guardPromptDefenseInjectContext: pickBoolean(resolvedOptions.guardPromptDefenseInjectContext)
+      ?? hasNonEmptyEnv("OPENCODE_GUARD_PROMPT_DEFENSE_INJECT"),
+    guardToolHooks: pickBoolean(resolvedOptions.guardToolHooks)
+      ?? hasNonEmptyEnv("OPENCODE_GUARD_TOOL_HOOKS"),
+    guardToolAllowlistPath: pickString(resolvedOptions.guardToolAllowlistPath)
+      ?? process.env["OPENCODE_GUARD_TOOL_ALLOWLIST_PATH"]
+      ?? join(homedir(), ".config", "opencode", "otel-guard-tool-allowlist.json"),
+    guardToolRedact: pickBoolean(resolvedOptions.guardToolRedact)
+      ?? hasNonEmptyEnv("OPENCODE_GUARD_TOOL_REDACT"),
+    guardPromptInjectionBlock: pickBoolean(resolvedOptions.guardPromptInjectionBlock)
+      ?? hasNonEmptyEnv("OPENCODE_GUARD_PROMPT_INJECTION_BLOCK"),
+    guardPromptInjectionMinSeverity: pickInjectionSeverity(resolvedOptions.guardPromptInjectionMinSeverity)
+      ?? (resolvedOptions.guardPromptInjectionMinSeverity !== undefined
+        ? "high" // explicit but invalid option must not silently fall through to env
+        : pickInjectionSeverity(process.env["OPENCODE_GUARD_PROMPT_INJECTION_MIN_SEVERITY"]) ?? "high"),
+  }
+
   return {
     enabled: pickBoolean(resolvedOptions.enabled) ?? hasNonEmptyEnv("OPENCODE_ENABLE_TELEMETRY"),
     logsEnabled: pickBoolean(resolvedOptions.logsEnabled) ?? !hasNonEmptyEnv("OPENCODE_DISABLE_LOGS"),
@@ -263,6 +401,7 @@ export function loadConfig(options: OtelPluginOptions = {}): PluginConfig {
     disabledMetrics,
     disabledTraces,
     tracePropagationProviders,
+    guard,
   }
 }
 
