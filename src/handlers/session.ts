@@ -1,7 +1,8 @@
 import { SeverityNumber } from "@opentelemetry/api-logs"
 import { SpanStatusCode } from "@opentelemetry/api"
 import type { EventOf, HandlerContext, SessionAgentType, SessionTotals } from "../types.ts"
-import { agentEndAttrs, agentSpanName, agentStartAttrs, errorAttrs, retryAttrs, signalAttrs } from "../semconv.ts"
+import { agentEndAttrs, agentOutputAttrs, agentSpanName, agentStartAttrs, errorAttrs, OPENCODE_ATTR, retryAttrs, signalAttrs } from "../semconv.ts"
+import { hashJson, sha256Hex } from "../facts.ts"
 import {
   errorSummary,
   isMetricEnabled,
@@ -35,14 +36,16 @@ export function handlePromptEnqueued(e: EventOf<"session.inbox.enqueued">, ctx: 
   const skills = normalizeNames(item.payload.skills?.map((skill) => skill.name), MAX_PROMPT_SKILLS, MAX_SKILL_NAME)
   if (item.delivery === "steer" && ctx.tracing.activeExecutions.has(sessionID)) {
     const active = ctx.tracing.activePrompts.get(sessionID)
+    const merged = active?.text ? `${active.text}\n${text}` : text
     setBoundedMap(ctx.tracing.activePrompts, sessionID, {
-      text: active?.text ? `${active.text}\n${text}` : text,
+      text: merged,
       startMs: active?.startMs ?? e.created,
+      ...(merged ? { hash: sha256Hex(merged) } : {}),
       ...mergeSkills(active?.skills, skills),
     })
   } else {
     const queue = ctx.tracing.pendingPrompts.get(sessionID) ?? []
-    if (queue.length < 100) queue.push({ text, startMs: e.created, ...(skills.length ? { skills } : {}) })
+    if (queue.length < 100) queue.push({ text, startMs: e.created, ...(text ? { hash: sha256Hex(text) } : {}), ...(skills.length ? { skills } : {}) })
     setBoundedMap(ctx.tracing.pendingPrompts, sessionID, queue)
   }
   const totals = ctx.tracing.sessionTotals.get(sessionID)
@@ -55,9 +58,13 @@ export function handlePromptEnqueued(e: EventOf<"session.inbox.enqueued">, ctx: 
     body: "user_prompt",
     attributes: {
       "event.name": "user_prompt",
-      ...signalAttrs(ctx.semconv, { sessionID, ...(totals ? { agent: totals.agent, agentType: totals.agentType } : {}) }),
+      ...signalAttrs(ctx.semconv, {
+        sessionID,
+        ...(totals ? { agent: totals.agent, agentType: totals.agentType, agentVersion: totals.agentVersion } : {}),
+      }),
       "message.id": inboxID,
       prompt_length: text.length,
+      ...(text ? { [OPENCODE_ATTR.promptHash]: sha256Hex(text) } : {}),
       ...(capturePrompt && ctx.captureContent
         ? { prompt: prompt.text, ...truncationAttrs("prompt", prompt) }
         : {}),
@@ -104,6 +111,7 @@ export function ensureSession(sessionID: string, at: number, ctx: HandlerContext
     messages: identity?.messages ?? 0,
     agent: identity?.agent ?? "unknown",
     agentType: identity?.agentType ?? "primary",
+    agentVersion: identity?.agentVersion ?? ctx.agentVersion,
     ...(identity?.parentID ? { parentID: identity.parentID } : {}),
   }
   setBoundedMap(ctx.tracing.sessionTotals, sessionID, totals)
@@ -121,6 +129,7 @@ export function handleSessionCreated(e: EventOf<"session.created">, ctx: Handler
   setBoundedMap(ctx.tracing.sessionIdentity, d.sessionID, {
     agent,
     agentType,
+    agentVersion: ctx.agentVersion,
     ...(d.parentID ? { parentID: d.parentID } : {}),
     startMs: e.created,
   })
@@ -128,7 +137,7 @@ export function handleSessionCreated(e: EventOf<"session.created">, ctx: Handler
   if (isSubagent && isMetricEnabled("subtask.count", ctx)) {
     ctx.instruments.subtaskCounter.add(1, {
       ...ctx.commonAttrs,
-      ...signalAttrs(ctx.semconv, { sessionID: d.sessionID, agentType: "subagent" }),
+      ...signalAttrs(ctx.semconv, { sessionID: d.sessionID, agent, agentType: "subagent", agentVersion: ctx.agentVersion }),
     })
   }
   if (isSubagent) {
@@ -140,7 +149,7 @@ export function handleSessionCreated(e: EventOf<"session.created">, ctx: Handler
       body: "subtask_invoked",
       attributes: {
         "event.name": "subtask_invoked",
-        ...signalAttrs(ctx.semconv, { sessionID: d.sessionID, agent, agentType }),
+        ...signalAttrs(ctx.semconv, { sessionID: d.sessionID, agent, agentType, agentVersion: ctx.agentVersion }),
         "parent.session.id": d.parentID,
         ...ctx.commonAttrs,
       },
@@ -154,6 +163,7 @@ export function handleSessionCreated(e: EventOf<"session.created">, ctx: Handler
     messages: ctx.tracing.sessionTotals.get(d.sessionID)?.messages ?? 0,
     agent,
     agentType,
+    agentVersion: ctx.agentVersion,
     ...(d.parentID ? { parentID: d.parentID } : {}),
   })
 
@@ -165,7 +175,7 @@ export function handleSessionCreated(e: EventOf<"session.created">, ctx: Handler
     body: "session.created",
     attributes: {
       "event.name": "session.created",
-      ...signalAttrs(ctx.semconv, { sessionID: d.sessionID, agent, agentType }),
+      ...signalAttrs(ctx.semconv, { sessionID: d.sessionID, agent, agentType, agentVersion: ctx.agentVersion }),
       is_subagent: isSubagent,
       ...(d.model ? { model: modelRef(d.model) } : {}),
       ...ctx.commonAttrs,
@@ -177,15 +187,16 @@ export function handleSessionCreated(e: EventOf<"session.created">, ctx: Handler
 export function handleAgentSelected(e: EventOf<"session.agent.selected">, ctx: HandlerContext) {
   const { sessionID, agent } = e.data
   const identity = ctx.tracing.sessionIdentity.get(sessionID)
-  if (identity) setBoundedMap(ctx.tracing.sessionIdentity, sessionID, { ...identity, agent })
+  if (identity) setBoundedMap(ctx.tracing.sessionIdentity, sessionID, { ...identity, agent, agentVersion: ctx.agentVersion })
   const totals = ctx.tracing.sessionTotals.get(sessionID)
-  if (totals) setBoundedMap(ctx.tracing.sessionTotals, sessionID, { ...totals, agent })
+  if (totals) setBoundedMap(ctx.tracing.sessionTotals, sessionID, { ...totals, agent, agentVersion: ctx.agentVersion })
 }
 
 /** Starts the root run span for a single execution (user turn), keyed by session id. */
 export function handleExecutionStarted(e: EventOf<"session.execution.started">, ctx: HandlerContext) {
   const sessionID = e.data.sessionID
   markSeen(ctx.tracing.activeExecutions, sessionID)
+  ctx.tracing.turnOutputs.delete(sessionID)
   const totals = ensureSession(sessionID, e.created, ctx)
   // Allocate the turn before the trace check so a later-enabled step/tool trace still
   // inherits a stable turn id, even when run spans are disabled.
@@ -215,11 +226,16 @@ export function handleExecutionStarted(e: EventOf<"session.execution.started">, 
           sessionID,
           agent: totals?.agent ?? "unknown",
           agentType: totals?.agentType ?? "primary",
+          agentVersion: totals?.agentVersion,
           isSubagent,
           turnID,
           ...(parentSessionID ? { parentSessionID } : {}),
           ...(parentToolCallID ? { parentToolCallID } : {}),
           ...(pendingPrompt?.skills?.length ? { skillNames: pendingPrompt.skills } : {}),
+          ...(pendingPrompt?.hash ? { promptHash: pendingPrompt.hash } : {}),
+          ...(ctx.tracing.sessionToolsets.get(sessionID)?.hash
+            ? { toolsetHash: ctx.tracing.sessionToolsets.get(sessionID)!.hash }
+            : {}),
           ...(promptText ? { promptText } : {}),
         }),
         ...ctx.commonAttrs,
@@ -229,6 +245,7 @@ export function handleExecutionStarted(e: EventOf<"session.execution.started">, 
   )
   setBoundedMap(ctx.tracing.runSpans, sessionID, span)
   setBoundedMap(ctx.tracing.runSpanContexts, sessionID, span.spanContext())
+  ctx.traceStore?.saveRun(sessionID, span.spanContext())
 }
 
 /** Terminal execution events that end the root run span. */
@@ -260,7 +277,21 @@ export function handleExecutionEnded(
   const span = ctx.tracing.runSpans.get(sessionID)
   if (span) {
     if (totals) {
-      span.setAttributes(agentEndAttrs(ctx.semconv, totals))
+      const toolset = ctx.tracing.sessionToolsets.get(sessionID)
+      const models = [...(ctx.tracing.sessionModels.get(sessionID) ?? [])].sort()
+      const configHash = hashJson({
+        agent: totals.agent,
+        version: totals.agentVersion ?? "",
+        toolset: toolset?.hash ?? "",
+        models,
+      })
+      span.setAttributes(agentEndAttrs(ctx.semconv, {
+        ...totals,
+        configHash,
+        ...(toolset?.hash ? { toolsetHash: toolset.hash } : {}),
+      }))
+      const output = ctx.captureContent ? ctx.tracing.turnOutputs.get(sessionID) : undefined
+      if (output) span.setAttributes(agentOutputAttrs(ctx.semconv, output))
       // The agent can only be resolved once a step or session lookup lands, which may be
       // after the run span started. Rename so a gen_ai span is not stuck at "invoke_agent unknown".
       span.updateName(agentSpanName(ctx.semconv, totals.agent, ctx.tracePrefix))
@@ -279,6 +310,8 @@ export function handleExecutionEnded(
     span.end(e.created)
     ctx.tracing.runSpans.delete(sessionID)
   }
+  ctx.tracing.turnOutputs.delete(sessionID)
+  void ctx.traceStore?.clear(sessionID)
 
   if (outcome.type === "failed") {
     const message = errorSummary(outcome.error)
@@ -294,6 +327,7 @@ export function handleExecutionEnded(
           sessionID,
           agent: totals?.agent ?? "unknown",
           agentType: totals?.agentType ?? "unknown",
+          agentVersion: totals?.agentVersion,
         }),
         error: message,
         ...errorAttrs(outcome.error),
@@ -324,9 +358,13 @@ export function handleRetryScheduled(e: EventOf<"session.retry.scheduled">, ctx:
   const count = (ctx.tracing.sessionRetries.get(sessionID) ?? 0) + 1
   setBoundedMap(ctx.tracing.sessionRetries, sessionID, count)
   if (isMetricEnabled("retry.count", ctx)) {
+    const totals = ctx.tracing.sessionTotals.get(sessionID)
     ctx.instruments.retryCounter.add(1, {
       ...ctx.commonAttrs,
-      ...signalAttrs(ctx.semconv, { sessionID }),
+      ...signalAttrs(ctx.semconv, {
+        sessionID,
+        ...(totals ? { agent: totals.agent, agentType: totals.agentType, agentVersion: totals.agentVersion } : {}),
+      }),
       ...retryAttrs({ attempt, error }),
     })
   }
@@ -381,14 +419,25 @@ export function finalizeSession(sessionID: string, ctx: HandlerContext) {
   }
   ctx.tracing.sessionTotals.delete(sessionID)
   ctx.tracing.runSpanContexts.delete(sessionID)
+  ctx.tracing.restoredRunContexts.delete(sessionID)
+  ctx.tracing.turnOutputs.delete(sessionID)
   ctx.tracing.activeLlm.delete(sessionID)
   ctx.tracing.activeStepSpans.delete(sessionID)
   ctx.tracing.modelContexts.delete(sessionID)
   ctx.tracing.activePrompts.delete(sessionID)
   ctx.tracing.activeExecutions.delete(sessionID)
   ctx.tracing.sessionRetries.delete(sessionID)
+  void ctx.traceStore?.clear(sessionID)
 
-  const attrs = { ...ctx.commonAttrs, ...signalAttrs(ctx.semconv, { sessionID }) }
+  const attrs = {
+    ...ctx.commonAttrs,
+    ...signalAttrs(ctx.semconv, {
+      sessionID,
+      agent: totals.agent,
+      agentType: totals.agentType,
+      agentVersion: totals.agentVersion,
+    }),
+  }
   const durationMs = Date.now() - totals.startMs
   if (isMetricEnabled("session.duration", ctx)) {
     ctx.instruments.sessionDurationHistogram.record(durationMs, attrs)
@@ -408,7 +457,12 @@ export function finalizeSession(sessionID: string, ctx: HandlerContext) {
     body: "session.idle",
     attributes: {
       "event.name": "session.idle",
-      ...signalAttrs(ctx.semconv, { sessionID, agent: totals.agent, agentType: totals.agentType }),
+      ...signalAttrs(ctx.semconv, {
+        sessionID,
+        agent: totals.agent,
+        agentType: totals.agentType,
+        agentVersion: totals.agentVersion,
+      }),
       total_tokens: totals.tokens,
       total_cost_usd: totals.cost,
       total_messages: totals.messages,
@@ -450,10 +504,70 @@ function sweepExecution(sessionID: string, ctx: HandlerContext) {
     }
     ctx.tracing.stepSpans.delete(messageID)
     ctx.tracing.stepSpanContexts.delete(messageID)
+    ctx.tracing.restoredStepContexts.delete(messageID)
     ctx.tracing.stepMeta.delete(messageID)
     ctx.tracing.stepOutputs.delete(messageID)
+    ctx.tracing.stepReasoning.delete(messageID)
+  }
+  for (const [messageID, restored] of ctx.tracing.restoredStepContexts) {
+    if (restored.sessionID === sessionID) ctx.tracing.restoredStepContexts.delete(messageID)
   }
   for (const [id, perm] of ctx.tracing.pendingPermissions) {
     if (perm.sessionID === sessionID) ctx.tracing.pendingPermissions.delete(id)
   }
+}
+
+/**
+ * Clears every per-session correlation map when opencode deletes a session. Without this the
+ * state would only leave memory when the bounded maps evict it, and a reused id could inherit
+ * another session's spans.
+ */
+export async function handleSessionDeleted(e: EventOf<"session.deleted">, ctx: HandlerContext) {
+  const sessionID = e.data.sessionID
+  ctx.tracing.activeExecutions.delete(sessionID)
+  sweepExecution(sessionID, ctx)
+  const span = ctx.tracing.runSpans.get(sessionID)
+  if (span) {
+    span.setAttribute("session.deleted", true)
+    span.end(e.created)
+    ctx.tracing.runSpans.delete(sessionID)
+  }
+  ctx.tracing.runSpanContexts.delete(sessionID)
+  ctx.tracing.restoredRunContexts.delete(sessionID)
+  ctx.tracing.restorePromises.delete(sessionID)
+  ctx.tracing.sessionTotals.delete(sessionID)
+  ctx.tracing.sessionIdentity.delete(sessionID)
+  ctx.tracing.sessionProjects.delete(sessionID)
+  ctx.tracing.sessionToolsets.delete(sessionID)
+  ctx.tracing.sessionModels.delete(sessionID)
+  ctx.tracing.sessionTurns.delete(sessionID)
+  ctx.tracing.sessionRetries.delete(sessionID)
+  ctx.tracing.pendingPrompts.delete(sessionID)
+  ctx.tracing.activePrompts.delete(sessionID)
+  ctx.tracing.modelContexts.delete(sessionID)
+  ctx.tracing.turnOutputs.delete(sessionID)
+  ctx.tracing.activeLlm.delete(sessionID)
+  ctx.tracing.provisionalLlm.delete(sessionID)
+  ctx.tracing.activeStepSpans.delete(sessionID)
+  ctx.tracing.subagentParents.delete(sessionID)
+  for (const [callID, meta] of ctx.tracing.toolMeta) {
+    if (meta.sessionID === sessionID) ctx.tracing.toolMeta.delete(callID)
+  }
+  await ctx.traceStore?.clear(sessionID)
+}
+
+/**
+ * Ends spans left open by an in-flight execution when the last plugin instance in the process
+ * unloads. The persisted trace context stays, so the replacement instance keeps the same trace.
+ */
+export function finalizeOnShutdown(ctx: HandlerContext) {
+  for (const [sessionID, span] of [...ctx.tracing.runSpans]) {
+    sweepExecution(sessionID, ctx)
+    span.setAttribute("session.interrupted_reason", "plugin stopped")
+    span.setStatus({ code: SpanStatusCode.OK })
+    span.end()
+    ctx.tracing.runSpans.delete(sessionID)
+  }
+  ctx.tracing.provisionalLlm.clear()
+  ctx.tracing.turnOutputs.clear()
 }

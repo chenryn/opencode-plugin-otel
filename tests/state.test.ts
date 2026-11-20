@@ -1,14 +1,45 @@
 import { describe, test, expect } from "bun:test"
 import { loadConfig } from "../src/config.ts"
-import { acquireSharedOtel, configKey, createFlushScheduler } from "../src/state.ts"
+import { acquireSharedOtel, acquireTracingState, configKey, createFlushScheduler } from "../src/state.ts"
 import { makeCtx } from "./helpers.ts"
 import { consumeEvents, contextForSession, enqueueEvent, markSeen } from "../src/util.ts"
 import type { HandlerContext } from "../src/types.ts"
 import { handleExecutionStarted } from "../src/handlers/session.ts"
-import { handleModelRequest } from "../src/handlers/chat-headers.ts"
+import { captureToolset, handleModelRequest } from "../src/handlers/chat-headers.ts"
 import { evt } from "./helpers.ts"
 
 describe("multi-location telemetry", () => {
+  test("upgrades hot-reloaded tracing state while preserving active sessions", () => {
+    const key = "__opencode_plugin_otel_tracing__"
+    const globals = globalThis as Record<string, unknown>
+    const previous = globals[key]
+    const { ctx } = makeCtx()
+    const legacy = ctx.tracing
+    legacy.sessionProjects.set("s", "project")
+    Reflect.deleteProperty(legacy, "sessionToolsets")
+    Reflect.deleteProperty(legacy, "sessionModels")
+    globals[key] = legacy
+    try {
+      const tracing = acquireTracingState()
+      expect(tracing).toBe(legacy)
+      expect(tracing.sessionProjects.get("s")).toBe("project")
+      expect(tracing.eventQueue).toBe(legacy.eventQueue)
+      captureToolset({ sessionID: "s", agent: "build", model: { providerID: "test", id: "m" }, system: [], messages: [], tools: { bash: {} } }, { ...ctx, tracing })
+      expect(tracing.sessionToolsets.get("s")?.tools).toEqual(["bash"])
+      tracing.sessionModels.set("s", new Set(["test/m"]))
+      expect(acquireTracingState().sessionToolsets).toBe(tracing.sessionToolsets)
+      expect(acquireTracingState().sessionModels.get("s")).toEqual(new Set(["test/m"]))
+    } finally {
+      globals[key] = previous
+    }
+  })
+
+  test("agentVersion does not change the shared provider configuration key", () => {
+    const first = loadConfig({ enabled: true, agentVersion: "1.0.0" })
+    const second = loadConfig({ enabled: true, agentVersion: "2.0.0" })
+    expect(configKey(first)).toBe(configKey(second))
+  })
+
   test("rejects a second location with different exporter settings", async () => {
     const first = loadConfig({ enabled: true, endpoint: "http://one:4317", otlpHeaders: "Authorization=secret-a" })
     const second = loadConfig({ enabled: true, endpoint: "http://two:4317", otlpHeaders: "Authorization=secret-b" })

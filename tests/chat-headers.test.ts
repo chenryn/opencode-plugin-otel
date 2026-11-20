@@ -1,6 +1,7 @@
 import { describe, test, expect } from "bun:test"
 import { captureModelContext, handleModelRequest } from "../src/handlers/chat-headers.ts"
 import { handleStepStarted } from "../src/handlers/step.ts"
+import { handleExecutionStarted } from "../src/handlers/session.ts"
 import { makeCtx, evt } from "./helpers.ts"
 
 const SPAN_CONTEXT = {
@@ -101,5 +102,54 @@ describe("captureModelContext", () => {
     ctx.tracePropagationProviders.add("*")
     await handleModelRequest({ sessionID: "ses_1", agent: "build", model: { providerID: "vllm", id: "m" }, kind: "primary", headers: {} }, ctx)
     expect(tracer.spans[0]?.attributes["llm.input_messages"]).toBeUndefined()
+  })
+})
+
+describe("full context snapshot", () => {
+  const contextEvent = {
+    sessionID: "ses_1",
+    agent: "build",
+    model: { providerID: "anthropic", id: "claude-sonnet" },
+    system: [{ type: "text", text: "you are a coding agent" }],
+    messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+    tools: { read: { description: "read a file", input: { path: "string" } } },
+  }
+
+  test("attaches the whole model-visible context when enabled", () => {
+    const { ctx, tracer } = makeCtx()
+    ctx.captureContextSnapshot = true
+    handleExecutionStarted(evt("session.execution.started", { sessionID: "ses_1" }), ctx)
+    captureModelContext(contextEvent, ctx)
+    handleStepStarted(evt("session.step.started", {
+      sessionID: "ses_1",
+      assistantMessageID: "msg_1",
+      agent: "build",
+      model: { id: "claude-sonnet", providerID: "anthropic" },
+      started: 1500,
+    }), ctx)
+
+    const llm = tracer.spans.find((s) => s.name.startsWith("opencode.llm"))!
+    const snapshot = JSON.parse(llm.attributes["input.value"] as string)
+    expect(snapshot.system[0].text).toBe("you are a coding agent")
+    expect(snapshot.messages[0].content[0].text).toBe("hello")
+    expect(snapshot.tools.read.description).toBe("read a file")
+    expect(llm.attributes["input.mime_type"]).toBe("application/json")
+  })
+
+  test("stays off by default and keeps the bounded text preview", () => {
+    const { ctx, tracer } = makeCtx()
+    handleExecutionStarted(evt("session.execution.started", { sessionID: "ses_1" }), ctx)
+    captureModelContext(contextEvent, ctx)
+    handleStepStarted(evt("session.step.started", {
+      sessionID: "ses_1",
+      assistantMessageID: "msg_1",
+      agent: "build",
+      model: { id: "claude-sonnet", providerID: "anthropic" },
+      started: 1500,
+    }), ctx)
+
+    const llm = tracer.spans.find((s) => s.name.startsWith("opencode.llm"))!
+    expect(llm.attributes["input.value"]).toBe("hello")
+    expect(llm.attributes["input.mime_type"]).toBe("text/plain")
   })
 })

@@ -64,10 +64,16 @@ export type PluginConfig = {
   logsEnabled: boolean
   capturePromptInLogs: boolean
   captureModelContext: boolean
+  /** Attach the full model-visible context (system, messages, tool definitions) to the LLM span. */
+  captureContextSnapshot: boolean
   /** Emit factual tool metadata (verbatim command, file paths); independent of content capture. */
   captureToolFacts: boolean
   /** Emit log events that duplicate a span; the `gen_ai` flavor suppresses them when false. */
   emitRedundantEvents: boolean
+  /** Mirror every emitted log event to a local JSONL file. Default `true`. */
+  localEventLog: boolean
+  /** Destination of the mirrored log events. */
+  localEventLogPath: string
   logLevel: string | undefined
   endpoint: string
   protocol: "grpc" | "http/protobuf" | "http/json"
@@ -82,6 +88,8 @@ export type PluginConfig = {
   tracestate: string | undefined
   metricsTemporality: MetricsTemporality | undefined
   semconv: SemconvFlavor
+  /** Agent runtime version recorded as `gen_ai.agent.version`; falls back to the app version. */
+  agentVersion: string | undefined
   disabledMetrics: Set<string>
   disabledTraces: Set<string>
   tracePropagationProviders: Set<string>
@@ -116,8 +124,14 @@ export type OtelPluginOptions = {
   logsEnabled?: boolean
   capturePromptInLogs?: boolean
   captureModelContext?: boolean
+  /** Attach the full model-visible context (system, messages, tool definitions) to the LLM span. */
+  captureContextSnapshot?: boolean
   captureToolFacts?: boolean
   emitRedundantEvents?: boolean
+  /** Mirror emitted log events to a local JSONL file. Default `true`. */
+  localEventLog?: boolean
+  /** Local JSONL path for the mirrored log events. */
+  localEventLogPath?: string
   logLevel?: string
   endpoint?: string
   protocol?: "grpc" | "http/protobuf" | "http/json"
@@ -132,6 +146,8 @@ export type OtelPluginOptions = {
   tracestate?: string
   metricsTemporality?: MetricsTemporality
   semconv?: SemconvFlavor
+  /** Agent runtime version; `OPENCODE_AGENT_VERSION` overrides the app version. */
+  agentVersion?: string
   disabledMetrics?: string[]
   disabledTraces?: string[]
   tracePropagationProviders?: string[]
@@ -380,10 +396,17 @@ export function loadConfig(options: OtelPluginOptions = {}): PluginConfig {
     logsEnabled: pickBoolean(resolvedOptions.logsEnabled) ?? !hasNonEmptyEnv("OPENCODE_DISABLE_LOGS"),
     capturePromptInLogs: pickBoolean(resolvedOptions.capturePromptInLogs) ?? hasNonEmptyEnv("OPENCODE_CAPTURE_PROMPT_IN_LOGS"),
     captureModelContext: pickBoolean(resolvedOptions.captureModelContext) ?? hasNonEmptyEnv("OPENCODE_CAPTURE_MODEL_CONTEXT"),
+    captureContextSnapshot: pickBoolean(resolvedOptions.captureContextSnapshot)
+      ?? hasNonEmptyEnv("OPENCODE_CAPTURE_CONTEXT_SNAPSHOT"),
     captureToolFacts: pickBoolean(resolvedOptions.captureToolFacts)
       ?? readEnvBoolean("OPENCODE_CAPTURE_TOOL_FACTS", true),
     emitRedundantEvents: pickBoolean(resolvedOptions.emitRedundantEvents)
       ?? readEnvBoolean("OPENCODE_EMIT_REDUNDANT_EVENTS", true),
+    localEventLog: pickBoolean(resolvedOptions.localEventLog)
+      ?? readEnvBoolean("OPENCODE_LOCAL_EVENT_LOG", true),
+    localEventLogPath: pickString(resolvedOptions.localEventLogPath)
+      ?? process.env["OPENCODE_LOCAL_EVENT_LOG_PATH"]
+      ?? join(homedir(), ".local", "share", "opencode", "otel-log-events.jsonl"),
     logLevel: pickString(resolvedOptions.logLevel),
     endpoint: pickString(resolvedOptions.endpoint) ?? process.env["OPENCODE_OTLP_ENDPOINT"] ?? "http://localhost:4317",
     protocol,
@@ -398,6 +421,7 @@ export function loadConfig(options: OtelPluginOptions = {}): PluginConfig {
     tracestate,
     metricsTemporality,
     semconv,
+    agentVersion: pickString(resolvedOptions.agentVersion) ?? pickString(process.env["OPENCODE_AGENT_VERSION"]),
     disabledMetrics,
     disabledTraces,
     tracePropagationProviders,

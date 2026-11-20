@@ -96,7 +96,7 @@ async function emit(
 ): Promise<void> {
   const hctx = telemetry?.hctx
   if (!hctx) return
-  const { agentName, agentType } = getSessionAgentMeta(event.sessionID, hctx)
+  const { agentName, agentType, agentVersion } = getSessionAgentMeta(event.sessionID, hctx)
   hctx.emitEvent({
     severityNumber: extra["blocked"] ? SeverityNumber.WARN : SeverityNumber.INFO,
     severityText: extra["blocked"] ? "WARN" : "INFO",
@@ -112,6 +112,7 @@ async function emit(
         sessionID: event.sessionID,
         agent: agentName,
         agentType,
+        agentVersion,
       }),
       ...hctx.commonAttrs,
     },

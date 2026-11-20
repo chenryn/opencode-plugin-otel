@@ -3,6 +3,8 @@ import type { LogRecord, Logger } from "@opentelemetry/api-logs"
 import type { Plugin } from "@opencode/plugin"
 import type { OtelProviders } from "./otel.ts"
 import type { SemconvFlavor } from "./semconv.ts"
+import type { ToolSemantics } from "./facts.ts"
+import type { TraceStore } from "./trace-store.ts"
 
 /** Numeric priority map for log levels; higher value = higher severity. */
 export const LEVELS = { debug: 0, info: 1, warn: 2, error: 3 } as const
@@ -49,6 +51,8 @@ export type PendingPermission = {
 export type PendingPrompt = {
   text: string
   startMs: number
+  /** SHA-256 of the prompt text, so a backend can group prompts without the content. */
+  hash?: string
   /** Skill names hit by this prompt, attached to the run span that consumes it. */
   skills?: string[]
 }
@@ -120,12 +124,14 @@ export type SessionTotals = {
   messages: number
   agent: string
   agentType: SessionAgentType
+  agentVersion?: string
   parentID?: string
 }
 
 export type SessionIdentity = {
   agent: string
   agentType: SessionAgentType
+  agentVersion?: string
   parentID?: string
   startMs: number
   tokens?: number
@@ -141,6 +147,7 @@ export type StepMeta = {
   firstTokenAt?: number
   agent: string
   agentType: SessionAgentType | "unknown"
+  agentVersion?: string
   modelID: string
   providerID: string
   /** Turn id of the owning execution, inherited by its tool calls. */
@@ -163,6 +170,18 @@ export type ToolMeta = {
   stepID?: string
   /** Factual tool metadata captured when the call was observed. */
   toolFacts?: ToolFacts
+  /** SHA-256 of the serialized tool arguments. */
+  argsHash?: string
+  /** Attachment and destination facts derived from the tool arguments. */
+  semantics?: ToolSemantics
+  /** Result metadata reported by opencode when the tool finished. */
+  resultMetadata?: Record<string, unknown>
+}
+
+/** Toolset fingerprint reported by the model-visible request. */
+export type ToolsetFingerprint = {
+  hash: string
+  tools: string[]
 }
 
 /** Live LLM request metadata used by the `model.request` trace-propagation hook. */
@@ -186,6 +205,8 @@ export type ModelContextSnapshot = {
   modelID: string
   entries: MessageEntry[]
   inputValue?: string
+  /** Serialized full model-visible context, present only when `OPENCODE_CAPTURE_CONTEXT_SNAPSHOT` is on. */
+  full?: string
 }
 
 /**
@@ -226,11 +247,23 @@ export type TracingState = {
   countedMessages: Set<string>
   sessionProjects: Map<string, string>
   sessionIdentity: Map<string, SessionIdentity>
+  /** Latest model-visible toolset fingerprint per session. */
+  sessionToolsets: Map<string, ToolsetFingerprint>
+  /** Model ids observed per session, used for the agent configuration fingerprint. */
+  sessionModels: Map<string, Set<string>>
   /** Last observed execution (turn) sequence per session, used to build `gen_ai.turn.id`. */
   sessionTurns: Map<string, number>
   /** Retries observed in the current execution per session, used for `session.retry.count`. */
   sessionRetries: Map<string, number>
   stepOutputs: Map<string, Map<number, string>>
+  /** Reasoning text streamed per step, in ordinal order, awaiting the step end. */
+  stepReasoning: Map<string, Map<number, string>>
+  /** Assistant text accumulated for the current execution, attached to the run span output. */
+  turnOutputs: Map<string, string>
+  /** In-flight context compaction span per session. */
+  compactionSpans: Map<string, Span>
+  /** Start time and reason of the in-flight compaction, keyed like {@link compactionSpans}. */
+  compactionMeta: Map<string, { startMs: number; reason: string }>
   pendingPrompts: Map<string, PendingPrompt[]>
   activePrompts: Map<string, PendingPrompt>
   activeExecutions: Set<string>
@@ -238,6 +271,12 @@ export type TracingState = {
   activeLlm: Map<string, LlmRequestContext>
   provisionalLlm: Map<string, Span>
   modelContexts: Map<string, ModelContextSnapshot>
+  /** Run/step span contexts restored from a previous plugin instance, keyed by session. */
+  restoredRunContexts: Map<string, SpanContext>
+  /** Step span contexts restored from a previous plugin instance, keyed by assistant message. */
+  restoredStepContexts: Map<string, { sessionID: string; spanContext: SpanContext }>
+  /** In-flight or completed storage restores per session, so a session is loaded once. */
+  restorePromises: Map<string, Promise<void>>
 }
 
 /** Shared context threaded through every event handler. */
@@ -253,13 +292,19 @@ export type HandlerContext = {
   disabledMetrics: Set<string>
   disabledTraces: Set<string>
   semconv: SemconvFlavor
+  /** Agent runtime version recorded as `gen_ai.agent.version`; omitted when unknown. */
+  agentVersion?: string
   /** Whether message/tool content may be serialized into spans and logs. */
   captureContent: boolean
   /** Whether factual tool metadata (command, file paths) may be emitted. */
   captureToolFacts: boolean
+  /** Whether the full model-visible context may be attached to the LLM span. */
+  captureContextSnapshot: boolean
   tracer: Tracer
   tracePrefix: string
   rootContext: () => Context
   tracing: TracingState
   tracePropagationProviders: Set<string>
+  /** Persists the run/step span context across plugin instance replacement. */
+  traceStore?: TraceStore
 }

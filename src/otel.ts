@@ -45,8 +45,18 @@ export function buildResource(version: string, resourceAttributes = process.env[
   const attrs: Record<string, string> = {
     [ATTR_SERVICE_NAME]: "opencode",
     "app.version": version,
+    "service.version": process.env["OPENCODE_SERVICE_VERSION"] ?? version,
     "os.type": process.platform,
     [ATTR_HOST_ARCH]: process.arch,
+    ...(process.env["OPENCODE_DEPLOYMENT_ID"]
+      ? { "deployment.id": process.env["OPENCODE_DEPLOYMENT_ID"] }
+      : {}),
+    ...(process.env["OPENCODE_DEPLOYMENT_ENVIRONMENT"]
+      ? { "deployment.environment.name": process.env["OPENCODE_DEPLOYMENT_ENVIRONMENT"] }
+      : {}),
+    ...(process.env["OPENCODE_VCS_REF"]
+      ? { "vcs.ref.head.revision": process.env["OPENCODE_VCS_REF"] }
+      : {}),
     ...parseAttributePairs(resourceAttributes),
   }
   return resourceFromAttributes(attrs)

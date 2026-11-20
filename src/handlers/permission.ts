@@ -27,7 +27,7 @@ export function handlePermissionAsked(e: EventOf<"permission.asked">, ctx: Handl
     sessionID: d.sessionID,
     ...source,
   })
-  const { agentName, agentType } = getSessionAgentMeta(d.sessionID, ctx)
+  const { agentName, agentType, agentVersion } = getSessionAgentMeta(d.sessionID, ctx)
   const targetContext = targetSpanContext(source.toolCallID, ctx)
   ctx.emitEvent({
     severityNumber: SeverityNumber.INFO,
@@ -37,7 +37,7 @@ export function handlePermissionAsked(e: EventOf<"permission.asked">, ctx: Handl
     body: "permission.requested",
     attributes: {
       "event.name": "permission.requested",
-      ...signalAttrs(ctx.semconv, { sessionID: d.sessionID, agent: agentName, agentType, tool: d.action }),
+      ...signalAttrs(ctx.semconv, { sessionID: d.sessionID, agent: agentName, agentType, agentVersion, tool: d.action }),
       ...requestAttrs(d.id),
       "permission.action": d.action,
       "permission.resources": d.resources.slice(0, MAX_PERMISSION_RESOURCES),
@@ -58,7 +58,7 @@ export function handlePermissionReplied(e: EventOf<"permission.replied">, ctx: H
   const pending = ctx.tracing.pendingPermissions.get(d.requestID)
   ctx.tracing.pendingPermissions.delete(d.requestID)
   const decision = d.reply === "reject" ? "reject" : "accept"
-  const { agentName, agentType } = getSessionAgentMeta(d.sessionID, ctx)
+  const { agentName, agentType, agentVersion } = getSessionAgentMeta(d.sessionID, ctx)
   const targetContext = targetSpanContext(pending?.toolCallID, ctx)
 
   ctx.emitEvent({
@@ -69,7 +69,7 @@ export function handlePermissionReplied(e: EventOf<"permission.replied">, ctx: H
     body: "tool_decision",
     attributes: {
       "event.name": "tool_decision",
-      ...signalAttrs(ctx.semconv, { sessionID: d.sessionID, agent: agentName, agentType, tool: pending?.action ?? "unknown" }),
+      ...signalAttrs(ctx.semconv, { sessionID: d.sessionID, agent: agentName, agentType, agentVersion, tool: pending?.action ?? "unknown" }),
       ...(pending?.action ? { "permission.action": pending.action } : {}),
       ...(pending ? resourcesAttrs(ctx, pending.resources) : {}),
       ...requestAttrs(d.requestID),

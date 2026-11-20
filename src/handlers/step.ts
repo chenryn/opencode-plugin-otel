@@ -19,6 +19,7 @@ import { ensureSession } from "./session.ts"
 import { applyModelContext } from "./chat-headers.ts"
 import {
   currentTurnID,
+  appendTurnOutput,
   errorSummary,
   genAiProviderName,
   isMetricEnabled,
@@ -64,18 +65,23 @@ export function handleStepStarted(e: EventOf<"session.step.started">, ctx: Handl
   const d = e.data
   const totals = ensureSession(d.sessionID, e.created, ctx)
   const agentType = totals.agentType
+  const agentVersion = totals.agentVersion
   const turnID = currentTurnID(d.sessionID, ctx)
+  const models = ctx.tracing.sessionModels.get(d.sessionID) ?? new Set<string>()
+  models.add(d.model.id)
+  setBoundedMap(ctx.tracing.sessionModels, d.sessionID, models)
   setBoundedMap(ctx.tracing.stepMeta, d.assistantMessageID, {
     sessionID: d.sessionID,
     startMs: d.started ?? e.created,
     agent: d.agent,
     agentType,
+    agentVersion,
     modelID: d.model.id,
     providerID: d.model.providerID,
     ...(turnID ? { turnID } : {}),
   })
   if (totals && totals.agent !== d.agent) {
-    setBoundedMap(ctx.tracing.sessionTotals, d.sessionID, { ...totals, agent: d.agent })
+    setBoundedMap(ctx.tracing.sessionTotals, d.sessionID, { ...totals, agent: d.agent, agentVersion: ctx.agentVersion })
   }
 
   if (!isTraceEnabled("llm", ctx)) return
@@ -85,10 +91,14 @@ export function handleStepStarted(e: EventOf<"session.step.started">, ctx: Handl
       sessionID: d.sessionID,
       agent: d.agent,
       agentType,
+      agentVersion,
       providerID: d.model.providerID,
       modelID: d.model.id,
       ...(turnID ? { turnID } : {}),
       stepID: d.assistantMessageID,
+      ...(ctx.tracing.sessionToolsets.get(d.sessionID)?.hash
+        ? { toolsetHash: ctx.tracing.sessionToolsets.get(d.sessionID)!.hash }
+        : {}),
       ...(promptText ? { promptText } : {}),
     }),
     ...ctx.commonAttrs,
@@ -121,6 +131,7 @@ export function handleStepStarted(e: EventOf<"session.step.started">, ctx: Handl
     providerID: d.model.providerID,
     spanContext: span.spanContext(),
   })
+  ctx.traceStore?.saveStep(d.sessionID, d.assistantMessageID, span.spanContext())
 }
 
 /** Records the first streamed text token for the active LLM step. */
@@ -138,6 +149,14 @@ export function handleTextEnded(e: EventOf<"session.text.ended">, ctx: HandlerCo
   const output = ctx.tracing.stepOutputs.get(assistantMessageID) ?? new Map<number, string>()
   if (output.size < 32 || output.has(ordinal)) output.set(ordinal, text.slice(0, STEP_OUTPUT_BUFFER_LIMIT))
   setBoundedMap(ctx.tracing.stepOutputs, assistantMessageID, output)
+}
+
+/** Buffers a completed reasoning segment so it can be attached to the step span output. */
+export function handleReasoningEnded(e: EventOf<"session.reasoning.ended">, ctx: HandlerContext) {
+  const { assistantMessageID, ordinal, text } = e.data
+  const reasoning = ctx.tracing.stepReasoning.get(assistantMessageID) ?? new Map<number, string>()
+  if (reasoning.size < 32 || reasoning.has(ordinal)) reasoning.set(ordinal, text.slice(0, STEP_OUTPUT_BUFFER_LIMIT))
+  setBoundedMap(ctx.tracing.stepReasoning, assistantMessageID, reasoning)
 }
 
 function countMessage(messageID: string, sessionID: string, modelID: string, providerID: string, agent: string, ctx: HandlerContext): boolean {
@@ -158,6 +177,12 @@ function outputText(messageID: string, ctx: HandlerContext): string | undefined 
   return [...output].sort(([a], [b]) => a - b).map(([, text]) => text).join("\n")
 }
 
+function reasoningText(messageID: string, ctx: HandlerContext): string | undefined {
+  const reasoning = ctx.tracing.stepReasoning.get(messageID)
+  if (!reasoning) return undefined
+  return [...reasoning].sort(([a], [b]) => a - b).map(([, text]) => text).join("\n")
+}
+
 /** Records the TTFT histogram and returns the latency in milliseconds for span attributes. */
 function recordTtft(
   meta: { startMs: number; firstTokenAt?: number } | undefined,
@@ -165,6 +190,7 @@ function recordTtft(
   modelID: string,
   providerID: string,
   agent: string,
+  agentVersion: string | undefined,
   ctx: HandlerContext,
 ): number | undefined {
   if (meta?.firstTokenAt === undefined) return undefined
@@ -173,7 +199,7 @@ function recordTtft(
   // existed. Skip the histogram rather than failing the whole step handler.
   if (ctx.instruments.ttftHistogram && isMetricEnabled(GEN_AI_METRIC.timeToFirstToken, ctx)) {
     const attrs = ctx.semconv === "gen_ai"
-      ? { ...ctx.commonAttrs, ...inferenceMetricAttrs({ sessionID, modelID, providerID, agent }) }
+      ? { ...ctx.commonAttrs, ...inferenceMetricAttrs({ sessionID, modelID, providerID, agent, agentVersion }) }
       : {
           ...ctx.commonAttrs,
           "session.id": sessionID,
@@ -195,33 +221,39 @@ export function handleStepEnded(e: EventOf<"session.step.ended">, ctx: HandlerCo
   const sessionTotals = ctx.tracing.sessionTotals.get(d.sessionID)
   const agent = meta?.agent ?? sessionTotals?.agent ?? "unknown"
   const agentType = meta?.agentType ?? sessionTotals?.agentType ?? "unknown"
+  const agentVersion = meta?.agentVersion ?? sessionTotals?.agentVersion
   const modelID = meta?.modelID ?? "unknown"
   const providerID = meta?.providerID ?? "unknown"
   const durationMs = Math.max(0, e.created - (meta?.startMs ?? e.created))
-  const ttftMs = recordTtft(meta, d.sessionID, modelID, providerID, agent, ctx)
+  const ttftMs = recordTtft(meta, d.sessionID, modelID, providerID, agent, agentVersion, ctx)
 
-  recordUsageMetrics(d.sessionID, modelID, providerID, agent, d.tokens, d.cost, ctx)
-  recordGenAiMetrics(d.sessionID, modelID, providerID, agent, d.tokens, durationMs, undefined, ctx)
+  recordUsageMetrics(d.sessionID, modelID, providerID, agent, agentVersion, d.tokens, d.cost, ctx)
+  recordGenAiMetrics(d.sessionID, modelID, providerID, agent, agentVersion, d.tokens, durationMs, undefined, ctx)
   const firstStep = countMessage(d.assistantMessageID, d.sessionID, modelID, providerID, agent, ctx)
   accumulateTotals(d.sessionID, allTokens(d.tokens), d.cost, firstStep, ctx)
 
   const span = ctx.tracing.stepSpans.get(d.assistantMessageID)
   const spanContext = ctx.tracing.stepSpanContexts.get(d.assistantMessageID)
+  const output = ctx.captureContent ? outputText(d.assistantMessageID, ctx) : undefined
   if (span) {
-    const output = ctx.captureContent ? outputText(d.assistantMessageID, ctx) : undefined
+    const reasoning = ctx.captureContent ? reasoningText(d.assistantMessageID, ctx) : undefined
     span.setAttributes(llmEndAttrs(ctx.semconv, {
       agent,
       agentType,
+      agentVersion,
       tokens: d.tokens,
       cost: d.cost,
       finish: d.finish,
       durationMs,
       ttftMs,
       ...(output ? { output } : {}),
+      ...(reasoning ? { reasoning } : {}),
     }))
     span.setStatus({ code: SpanStatusCode.OK })
     span.end(e.created)
   }
+  const turnText = ctx.captureContent ? output : undefined
+  if (turnText) appendTurnOutput(d.sessionID, turnText, ctx)
   cleanupStep(d.assistantMessageID, d.sessionID, ctx)
 
   ctx.emitEvent({
@@ -236,7 +268,7 @@ export function handleStepEnded(e: EventOf<"session.step.ended">, ctx: HandlerCo
       model: modelID,
       provider: providerID,
       "gen_ai.provider.name": genAiProviderName(providerID),
-      ...signalAttrs(ctx.semconv, { agent, agentType }),
+      ...signalAttrs(ctx.semconv, { agent, agentType, agentVersion }),
       ...costAttrs(ctx.semconv, d.cost),
       duration_ms: durationMs,
       input_tokens: d.tokens.input,
@@ -262,24 +294,27 @@ export function handleStepFailed(e: EventOf<"session.step.failed">, ctx: Handler
   const sessionTotals = ctx.tracing.sessionTotals.get(d.sessionID)
   const agent = meta?.agent ?? sessionTotals?.agent ?? "unknown"
   const agentType = meta?.agentType ?? sessionTotals?.agentType ?? "unknown"
+  const agentVersion = meta?.agentVersion ?? sessionTotals?.agentVersion
   const modelID = meta?.modelID ?? "unknown"
   const providerID = meta?.providerID ?? "unknown"
   const error = errorSummary(d.error)
   const durationMs = Math.max(0, e.created - (meta?.startMs ?? e.created))
-  const ttftMs = recordTtft(meta, d.sessionID, modelID, providerID, agent, ctx)
+  const ttftMs = recordTtft(meta, d.sessionID, modelID, providerID, agent, agentVersion, ctx)
 
-  recordUsageMetrics(d.sessionID, modelID, providerID, agent, d.tokens, d.cost, ctx)
-  recordGenAiMetrics(d.sessionID, modelID, providerID, agent, d.tokens, durationMs, d.error?.type ?? d.finish ?? "error", ctx)
+  recordUsageMetrics(d.sessionID, modelID, providerID, agent, agentVersion, d.tokens, d.cost, ctx)
+  recordGenAiMetrics(d.sessionID, modelID, providerID, agent, agentVersion, d.tokens, durationMs, d.error?.type ?? d.finish ?? "error", ctx)
   const firstStep = countMessage(d.assistantMessageID, d.sessionID, modelID, providerID, agent, ctx)
   accumulateTotals(d.sessionID, allTokens(d.tokens), d.cost ?? 0, firstStep, ctx)
 
   const span = ctx.tracing.stepSpans.get(d.assistantMessageID)
   const spanContext = ctx.tracing.stepSpanContexts.get(d.assistantMessageID)
+  const output = ctx.captureContent ? outputText(d.assistantMessageID, ctx) : undefined
   if (span) {
-    const output = ctx.captureContent ? outputText(d.assistantMessageID, ctx) : undefined
+    const reasoning = ctx.captureContent ? reasoningText(d.assistantMessageID, ctx) : undefined
     span.setAttributes(llmFailAttrs(ctx.semconv, {
       agent,
       agentType,
+      agentVersion,
       finish: d.finish,
       error: d.error,
       durationMs,
@@ -287,10 +322,12 @@ export function handleStepFailed(e: EventOf<"session.step.failed">, ctx: Handler
       ...(d.tokens ? { tokens: d.tokens } : {}),
       ...(d.cost !== undefined ? { cost: d.cost } : {}),
       ...(output ? { output } : {}),
+      ...(reasoning ? { reasoning } : {}),
     }))
     span.setStatus({ code: SpanStatusCode.ERROR, message: error })
     span.end(e.created)
   }
+  if (output) appendTurnOutput(d.sessionID, output, ctx)
   cleanupStep(d.assistantMessageID, d.sessionID, ctx)
 
   ctx.emitEvent({
@@ -305,7 +342,7 @@ export function handleStepFailed(e: EventOf<"session.step.failed">, ctx: Handler
       model: modelID,
       provider: providerID,
       "gen_ai.provider.name": genAiProviderName(providerID),
-      ...signalAttrs(ctx.semconv, { agent, agentType }),
+      ...signalAttrs(ctx.semconv, { agent, agentType, agentVersion }),
       error,
       ...errorAttrs(d.error),
       duration_ms: durationMs,
@@ -325,11 +362,12 @@ function recordUsageMetrics(
   modelID: string,
   providerID: string,
   agent: string,
+  agentVersion: string | undefined,
   tokens: { input: number; output: number; reasoning: number; cache: { read: number; write: number } } | undefined,
   cost: number | undefined,
   ctx: HandlerContext,
 ) {
-  const base = { ...ctx.commonAttrs, ...signalAttrs(ctx.semconv, { sessionID, modelID, agent }) }
+  const base = { ...ctx.commonAttrs, ...signalAttrs(ctx.semconv, { sessionID, modelID, agent, agentVersion }) }
   // The `gen_ai` flavor reports token usage through the official histogram instead.
   if (tokens && ctx.semconv === "openinference" && isMetricEnabled("token.usage", ctx)) {
     const { tokenCounter } = ctx.instruments
@@ -366,6 +404,7 @@ function recordGenAiMetrics(
   modelID: string,
   providerID: string,
   agent: string,
+  agentVersion: string | undefined,
   tokens: { input: number; output: number; reasoning: number; cache: { read: number; write: number } } | undefined,
   durationMs: number,
   errorType: string | undefined,
@@ -374,7 +413,7 @@ function recordGenAiMetrics(
   if (ctx.semconv !== "gen_ai") return
   const base = {
     ...ctx.commonAttrs,
-    ...inferenceMetricAttrs({ sessionID, modelID, providerID, agent }),
+    ...inferenceMetricAttrs({ sessionID, modelID, providerID, agent, agentVersion }),
   }
   if (tokens) {
     const { inputTokensCounter, outputTokensCounter, cacheReadTokensCounter, cacheWriteTokensCounter, reasoningTokensCounter } = ctx.instruments
@@ -405,9 +444,11 @@ function cleanupStep(assistantMessageID: string, sessionID: string, ctx: Handler
   }
   ctx.tracing.stepSpans.delete(assistantMessageID)
   ctx.tracing.stepSpanContexts.delete(assistantMessageID)
+  ctx.tracing.restoredStepContexts.delete(assistantMessageID)
   ctx.tracing.stepMeta.delete(assistantMessageID)
   if (spanContext && ctx.tracing.activeLlm.get(sessionID)?.spanContext.spanId === spanContext.spanId) {
     ctx.tracing.activeLlm.delete(sessionID)
   }
   ctx.tracing.stepOutputs.delete(assistantMessageID)
+  ctx.tracing.stepReasoning.delete(assistantMessageID)
 }

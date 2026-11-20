@@ -219,7 +219,8 @@ async function emitToolEvent(
   const hctx = deps.telemetry?.hctx
   if (!hctx) return
   const sessionID = String(attributes["sessionID"] ?? "")
-  const agentName = sessionID ? getSessionAgentMeta(sessionID, hctx).agentName : undefined
+  const meta = sessionID ? getSessionAgentMeta(sessionID, hctx) : undefined
+  const agentName = meta?.agentName
   const spanContext: SpanContext | undefined = sessionSpanContext(sessionID, hctx)
   hctx.emitEvent({
     severityNumber: SeverityNumber.INFO,
@@ -233,6 +234,7 @@ async function emitToolEvent(
       ...signalAttrs(hctx.semconv, {
         sessionID,
         agent: typeof attributes["agent"] === "string" ? attributes["agent"] : agentName,
+        agentVersion: typeof attributes["agent"] === "string" ? undefined : meta?.agentVersion,
         tool: typeof attributes["tool"] === "string" ? attributes["tool"] : undefined,
       }),
       ...hctx.commonAttrs,

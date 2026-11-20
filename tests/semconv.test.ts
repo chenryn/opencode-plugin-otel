@@ -1,6 +1,8 @@
 import { describe, test, expect } from "bun:test"
 import {
+  ATTR_GEN_AI_AGENT_ID,
   ATTR_GEN_AI_AGENT_NAME,
+  ATTR_GEN_AI_AGENT_VERSION,
   ATTR_GEN_AI_CONVERSATION_ID,
   ATTR_GEN_AI_INPUT_MESSAGES,
   ATTR_GEN_AI_OPERATION_NAME,
@@ -22,8 +24,12 @@ import {
 } from "@opentelemetry/semantic-conventions/incubating"
 import {
   agentEndAttrs,
+  agentOutputAttrs,
   agentSpanName,
+  agentStableID,
   agentStartAttrs,
+  compactionAttrs,
+  costAttrs,
   DEFAULT_SEMCONV,
   GEN_AI_ATTR,
   GEN_AI_METRIC,
@@ -34,11 +40,13 @@ import {
   llmSpanName,
   llmStartAttrs,
   OUTPUT_TOKEN_MODALITY,
+  outputAttrs,
   parseSemconv,
   PROMPT_TOKEN_MODALITY,
   promptAttrs,
   retryAttrs,
   signalAttrs,
+  snapshotAttrs,
   toolCallAttrs,
   toolEndAttrs,
   toolFactsAttrs,
@@ -55,7 +63,9 @@ const GEN_AI_KEYS = {
   responseModel: ATTR_GEN_AI_RESPONSE_MODEL,
   responseFinishReasons: ATTR_GEN_AI_RESPONSE_FINISH_REASONS,
   conversationID: ATTR_GEN_AI_CONVERSATION_ID,
+  agentID: ATTR_GEN_AI_AGENT_ID,
   agentName: ATTR_GEN_AI_AGENT_NAME,
+  agentVersion: ATTR_GEN_AI_AGENT_VERSION,
   inputMessages: ATTR_GEN_AI_INPUT_MESSAGES,
   outputMessages: ATTR_GEN_AI_OUTPUT_MESSAGES,
   usageInputTokens: ATTR_GEN_AI_USAGE_INPUT_TOKENS,
@@ -102,6 +112,76 @@ describe("gen_ai attribute keys", () => {
     expect(Object.values(GEN_AI_KEYS)).not.toContain(GEN_AI_ATTR.turnID)
     expect(Object.values(GEN_AI_KEYS)).not.toContain(GEN_AI_ATTR.stepID)
     expect(Object.values(GEN_AI_KEYS)).not.toContain(GEN_AI_ATTR.usageCost)
+  })
+})
+
+describe("agent identity", () => {
+  test("derives a stable id from a known role and omits unresolved names", () => {
+    expect(agentStableID("build")).toBe("opencode:build")
+    expect(agentStableID(" explore ")).toBe("opencode:explore")
+    expect(agentStableID("unknown")).toBeUndefined()
+    expect(agentStableID("UNKNOWN")).toBeUndefined()
+    expect(agentStableID("")).toBeUndefined()
+    expect(agentStableID(undefined)).toBeUndefined()
+  })
+
+  test("gen_ai carries the id and version on spans and signal attributes", () => {
+    const run = agentStartAttrs("gen_ai", {
+      sessionID: "ses_1",
+      agent: "build",
+      agentType: "primary",
+      agentVersion: "1.2.3",
+      isSubagent: false,
+    })
+    expect(run["gen_ai.agent.id"]).toBe("opencode:build")
+    expect(run["gen_ai.agent.version"]).toBe("1.2.3")
+
+    const llm = llmStartAttrs("gen_ai", {
+      sessionID: "ses_1",
+      agent: "build",
+      agentVersion: "1.2.3",
+      providerID: "anthropic",
+      modelID: "claude",
+    })
+    expect(llm["gen_ai.agent.id"]).toBe("opencode:build")
+    expect(llm["gen_ai.agent.version"]).toBe("1.2.3")
+
+    const tool = toolCallAttrs("gen_ai", {
+      agent: "build",
+      agentType: "primary",
+      agentVersion: "1.2.3",
+      providerExecuted: false,
+    })
+    expect(tool["gen_ai.agent.id"]).toBe("opencode:build")
+    expect(tool["gen_ai.agent.version"]).toBe("1.2.3")
+
+    const signal = signalAttrs("gen_ai", { sessionID: "ses_1", agent: "build", agentVersion: "1.2.3" })
+    expect(signal["gen_ai.agent.id"]).toBe("opencode:build")
+    expect(signal["gen_ai.agent.version"]).toBe("1.2.3")
+  })
+
+  test("unknown agents do not become an id", () => {
+    const attrs = agentStartAttrs("gen_ai", {
+      sessionID: "ses_1",
+      agent: "unknown",
+      agentType: "primary",
+      isSubagent: false,
+    })
+    expect(attrs["gen_ai.agent.name"]).toBe("unknown")
+    expect(attrs["gen_ai.agent.id"]).toBeUndefined()
+  })
+
+  test("openinference keeps the existing agent.name attribute only", () => {
+    const attrs = agentStartAttrs("openinference", {
+      sessionID: "ses_1",
+      agent: "build",
+      agentType: "primary",
+      agentVersion: "1.2.3",
+      isSubagent: false,
+    })
+    expect(attrs["agent.name"]).toBe("build")
+    expect(attrs["gen_ai.agent.id"]).toBeUndefined()
+    expect(attrs["gen_ai.agent.version"]).toBeUndefined()
   })
 })
 
@@ -425,7 +505,7 @@ describe("signal attributes", () => {
 
 describe("redundant log events", () => {
   test("are only suppressible in the gen_ai flavor", () => {
-    for (const name of ["api_request", "api_error", "tool_result", "session.created"]) {
+    for (const name of ["api_request", "api_error", "tool_result", "session.created", "compaction"]) {
       expect(isEventSuppressed("gen_ai", name)).toBe(true)
       expect(isEventSuppressed("openinference", name)).toBe(false)
     }
@@ -563,5 +643,109 @@ describe("agent skill names", () => {
       })
       expect(withoutSkills["skill.name"]).toBeUndefined()
     }
+  })
+})
+
+describe("cost reporting", () => {
+  test("a provider-reported zero is treated as unknown and omitted", () => {
+    for (const flavor of ["openinference", "gen_ai"] as const) {
+      expect(costAttrs(flavor, 0)).toEqual({})
+      expect(costAttrs(flavor, -1)).toEqual({})
+      const attrs = llmEndAttrs(flavor, {
+        agent: "build",
+        agentType: "primary",
+        tokens: tokens(10, 5),
+        cost: 0,
+        finish: "stop",
+        durationMs: 100,
+      })
+      expect(attrs["cost_usd"]).toBeUndefined()
+      expect(attrs["llm.cost.total"]).toBeUndefined()
+      expect(attrs["gen_ai.usage.cost"]).toBeUndefined()
+    }
+  })
+
+  test("a positive cost is still reported in both dialects", () => {
+    expect(costAttrs("openinference", 0.5)).toEqual({ cost_usd: 0.5 })
+    expect(costAttrs("gen_ai", 0.5)).toEqual({ "gen_ai.usage.cost": 0.5 })
+  })
+})
+
+describe("assistant output content", () => {
+  test("reasoning travels beside the visible answer in both dialects", () => {
+    const openinference = outputAttrs("openinference", "answer", "stop", "thinking")
+    expect(openinference["output.value"]).toBe("answer")
+    expect(openinference["llm.output_messages"]).toBe('[{"role":"assistant","content":"answer"}]')
+    expect(openinference["content.reasoning"]).toBe("thinking")
+
+    const genAi = outputAttrs("gen_ai", "answer", "stop", "thinking")
+    expect(JSON.parse(genAi["gen_ai.output.messages"] as string)).toEqual([{
+      role: "assistant",
+      parts: [{ type: "reasoning", content: "thinking" }, { type: "text", content: "answer" }],
+      finish_reason: "stop",
+    }])
+    expect(genAi["content.reasoning"]).toBe("thinking")
+  })
+
+  test("a reasoning-only step still produces an output message", () => {
+    const genAi = outputAttrs("gen_ai", "", "stop", "thinking")
+    expect(JSON.parse(genAi["gen_ai.output.messages"] as string)[0].parts).toEqual([
+      { type: "reasoning", content: "thinking" },
+      { type: "text", content: "" },
+    ])
+  })
+
+  test("the run span output uses the dialect's assistant shape", () => {
+    expect(agentOutputAttrs("openinference", "done")).toMatchObject({
+      "output.value": "done",
+      "output.mime_type": "text/plain",
+    })
+    const genAi = agentOutputAttrs("gen_ai", "done")
+    expect(JSON.parse(genAi["gen_ai.output.messages"] as string)).toEqual([
+      { role: "assistant", parts: [{ type: "text", content: "done" }] },
+    ])
+    expect(agentOutputAttrs("gen_ai", "done")["output.value"]).toBeUndefined()
+  })
+})
+
+describe("full context snapshot", () => {
+  test("uses input.value with a JSON mime type for openinference", () => {
+    const attrs = snapshotAttrs("openinference", '{"system":[],"messages":[]}')
+    expect(attrs["input.value"]).toBe('{"system":[],"messages":[]}')
+    expect(attrs["input.mime_type"]).toBe("application/json")
+  })
+
+  test("uses the plugin extension key for gen_ai and marks truncation", () => {
+    const attrs = snapshotAttrs("gen_ai", "abcdef", 3)
+    expect(attrs["content.snapshot"]).toBe("abc")
+    expect(attrs["content.snapshot.truncated"]).toBe(true)
+    expect(attrs["content.snapshot.original_length"]).toBe(6)
+    expect(attrs["input.value"]).toBeUndefined()
+  })
+})
+
+describe("compaction", () => {
+  test("reports duration, usage, cost, and summary output", () => {
+    const openinference = compactionAttrs("openinference", {
+      reason: "auto",
+      durationMs: 900,
+      tokens: tokens(10, 5, 2, 1, 1),
+      cost: 0.3,
+      output: "summary",
+    })
+    expect(openinference["compaction.reason"]).toBe("auto")
+    expect(openinference["duration_ms"]).toBe(900)
+    expect(openinference["llm.token_count.total"]).toBe(19)
+    expect(openinference["cost_usd"]).toBe(0.3)
+    expect(openinference["output.value"]).toBe("summary")
+
+    const genAi = compactionAttrs("gen_ai", {
+      reason: "manual",
+      durationMs: 10,
+      tokens: tokens(4, 2),
+    })
+    expect(genAi["gen_ai.usage.input_tokens"]).toBe(4)
+    expect(genAi["gen_ai.usage.output_tokens"]).toBe(2)
+    expect(genAi["gen_ai.usage.cost"]).toBeUndefined()
   })
 })

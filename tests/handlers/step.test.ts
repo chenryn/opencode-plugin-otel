@@ -1,7 +1,7 @@
 import { describe, test, expect } from "bun:test"
 import { SpanStatusCode } from "@opentelemetry/api"
-import { handleStepEnded, handleStepFailed, handleStepStarted, handleTextEnded } from "../../src/handlers/step.ts"
-import { handleExecutionStarted, handleSessionCreated } from "../../src/handlers/session.ts"
+import { handleReasoningEnded, handleStepEnded, handleStepFailed, handleStepStarted, handleTextEnded } from "../../src/handlers/step.ts"
+import { handleExecutionEnded, handleExecutionStarted, handleSessionCreated } from "../../src/handlers/session.ts"
 import { makeCtx, evt, recordSpanContext, tokens } from "../helpers.ts"
 
 function seedSession(ctx: ReturnType<typeof makeCtx>["ctx"], sessionID = "ses_1") {
@@ -141,5 +141,48 @@ describe("assistant output truncation", () => {
     expect(span.attributes["content.output.truncated"]).toBe(true)
     expect(span.attributes["content.output.original_length"]).toBe(20_001)
     expect(String(span.attributes["output.value"]).length).toBe(20_000)
+  })
+})
+
+describe("reasoning and run output", () => {
+  test("captures reasoning text on the step span without polluting the answer", () => {
+    const { ctx, tracer } = makeCtx()
+    seedSession(ctx)
+    handleStepStarted(stepStarted(), ctx)
+    handleReasoningEnded(evt("session.reasoning.ended", { sessionID: "ses_1", assistantMessageID: "msg_1", ordinal: 0, text: "step one" }), ctx)
+    handleReasoningEnded(evt("session.reasoning.ended", { sessionID: "ses_1", assistantMessageID: "msg_1", ordinal: 1, text: "step two" }), ctx)
+    handleTextEnded(evt("session.text.ended", { sessionID: "ses_1", assistantMessageID: "msg_1", ordinal: 0, text: "hello" }), ctx)
+    handleStepEnded(evt("session.step.ended", { sessionID: "ses_1", assistantMessageID: "msg_1", finish: "stop", cost: 0.25, tokens: tokens(10, 5, 2) }, 2000), ctx)
+
+    const llm = tracer.spans.find((s) => s.name === "opencode.llm")!
+    expect(llm.attributes["content.reasoning"]).toBe("step one\nstep two")
+    expect(llm.attributes["output.value"]).toBe("hello")
+    expect(ctx.tracing.stepReasoning.has("msg_1")).toBe(false)
+  })
+
+  test("attaches the accumulated assistant text to the run span output", () => {
+    const { ctx, tracer } = makeCtx()
+    seedSession(ctx)
+    handleStepStarted(stepStarted(), ctx)
+    handleTextEnded(evt("session.text.ended", { sessionID: "ses_1", assistantMessageID: "msg_1", ordinal: 0, text: "first" }), ctx)
+    handleStepEnded(evt("session.step.ended", { sessionID: "ses_1", assistantMessageID: "msg_1", finish: "stop", cost: 0.25, tokens: tokens(10, 5) }, 2000), ctx)
+    handleExecutionEnded(evt("session.execution.succeeded", { sessionID: "ses_1" }, 3000), ctx, { type: "succeeded" })
+
+    const run = tracer.spans.find((s) => s.name === "opencode.session")!
+    expect(run.attributes["output.value"]).toBe("first")
+    expect(ctx.tracing.turnOutputs.has("ses_1")).toBe(false)
+  })
+
+  test("does not capture reasoning when content capture is disabled", () => {
+    const { ctx, tracer } = makeCtx("proj_test", [], [], true, {}, "gen_ai", false)
+    seedSession(ctx)
+    handleStepStarted(stepStarted(), ctx)
+    handleReasoningEnded(evt("session.reasoning.ended", { sessionID: "ses_1", assistantMessageID: "msg_1", ordinal: 0, text: "hidden" }), ctx)
+    handleTextEnded(evt("session.text.ended", { sessionID: "ses_1", assistantMessageID: "msg_1", ordinal: 0, text: "visible" }), ctx)
+    handleStepEnded(evt("session.step.ended", { sessionID: "ses_1", assistantMessageID: "msg_1", finish: "stop", cost: 0.25, tokens: tokens(10, 5) }, 2000), ctx)
+
+    const llm = tracer.spans.find((s) => s.name === "chat claude-sonnet")!
+    expect(llm.attributes["content.reasoning"]).toBeUndefined()
+    expect(llm.attributes["gen_ai.output.messages"]).toBeUndefined()
   })
 })

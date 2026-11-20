@@ -78,6 +78,7 @@ describe("loadConfig", () => {
     "OPENCODE_CAPTURE_MODEL_CONTEXT",
     "OPENCODE_CAPTURE_TOOL_FACTS",
     "OPENCODE_EMIT_REDUNDANT_EVENTS",
+    "OPENCODE_AGENT_VERSION",
     "OPENCODE_DISABLE_TRACES",
     "OPENCODE_TRACE_PROPAGATION_PROVIDERS",
     "OPENCODE_SEMCONV",
@@ -137,6 +138,17 @@ describe("loadConfig", () => {
       console.warn = original
     }
     expect(warnings.some((message) => message.includes("OPENCODE_SEMCONV"))).toBe(true)
+  })
+
+  test("agentVersion is unset by default and reads the environment", () => {
+    expect(loadConfig().agentVersion).toBeUndefined()
+    process.env["OPENCODE_AGENT_VERSION"] = "1.2.3"
+    expect(loadConfig().agentVersion).toBe("1.2.3")
+  })
+
+  test("an agentVersion option wins over the environment", () => {
+    process.env["OPENCODE_AGENT_VERSION"] = "env"
+    expect(loadConfig({ agentVersion: "option" }).agentVersion).toBe("option")
   })
 
   test("capturePromptInLogs is true when OPENCODE_CAPTURE_PROMPT_IN_LOGS is set", () => {
@@ -237,6 +249,14 @@ describe("loadConfig", () => {
     process.env["OPENCODE_CAPTURE_MODEL_CONTEXT"] = "1"
     expect(loadConfig().captureModelContext).toBe(true)
     expect(loadConfig({ captureModelContext: false }).captureModelContext).toBe(false)
+  })
+
+  test("captures the full context snapshot only when explicitly enabled", () => {
+    expect(loadConfig().captureContextSnapshot).toBe(false)
+    process.env["OPENCODE_CAPTURE_CONTEXT_SNAPSHOT"] = "1"
+    expect(loadConfig().captureContextSnapshot).toBe(true)
+    expect(loadConfig({ captureContextSnapshot: false }).captureContextSnapshot).toBe(false)
+    expect(loadConfig({ captureContextSnapshot: true }).captureContextSnapshot).toBe(true)
   })
 
   test("captures tool facts by default and accepts an opt-out", () => {

@@ -1,18 +1,22 @@
 import { describe, test, expect } from "bun:test"
 import { SpanStatusCode } from "@opentelemetry/api"
 import {
+  finalizeOnShutdown,
   finalizeSession,
   handleExecutionEnded,
   handleExecutionStarted,
   handleAgentSelected,
   handlePromptEnqueued,
   handleSessionCreated,
+  handleSessionDeleted,
   handleSessionIdle,
   handleSessionStatus,
   handleRetryScheduled,
   handleUsageUpdated,
 } from "../../src/handlers/session.ts"
 import { makeCtx, evt, recordSpanContext, tokens } from "../helpers.ts"
+import { captureToolset } from "../../src/handlers/chat-headers.ts"
+import { hashJson, sha256Hex } from "../../src/facts.ts"
 
 describe("handleSessionCreated", () => {
   test("increments the session counter and stores totals", () => {
@@ -387,5 +391,94 @@ describe("prompt truncation", () => {
     expect(prompt.attributes?.["prompt.truncated"]).toBe(true)
     expect(prompt.attributes?.["prompt.original_length"]).toBe(20_001)
     expect(prompt.attributes?.["prompt_length"]).toBe(20_001)
+  })
+})
+
+describe("fingerprints", () => {
+  test("records prompt, toolset, and agent config hashes", () => {
+    const { ctx, tracer } = makeCtx()
+    handleSessionCreated(evt("session.created", { sessionID: "ses_1", agent: "build" }), ctx)
+    handlePromptEnqueued(evt("session.inbox.enqueued", {
+      sessionID: "ses_1",
+      inboxID: "inb_1",
+      item: { type: "user", payload: { text: "hello" }, delivery: "queue" },
+    }), ctx, false)
+    captureToolset({
+      sessionID: "ses_1",
+      agent: "build",
+      model: { providerID: "p", id: "m" },
+      system: [],
+      messages: [],
+      tools: { shell: {}, edit: {} },
+    }, ctx)
+    handleExecutionStarted(evt("session.execution.started", { sessionID: "ses_1" }, 2000), ctx)
+    handleExecutionEnded(evt("session.execution.succeeded", { sessionID: "ses_1" }, 3000), ctx, { type: "succeeded" })
+    const span = tracer.spans.find((s) => s.name === "opencode.session")!
+    expect(span.attributes["opencode.prompt.hash"]).toBe(sha256Hex("hello"))
+    expect(span.attributes["opencode.toolset.hash"]).toBe(hashJson(["edit", "shell"]))
+    expect(typeof span.attributes["opencode.agent.config_hash"]).toBe("string")
+  })
+})
+
+describe("session.deleted", () => {
+  test("ends the run span and clears every per-session map", async () => {
+    const cleared: string[] = []
+    const { ctx, tracer } = makeCtx()
+    ctx.traceStore = {
+      load: async () => undefined,
+      saveRun() {},
+      saveStep() {},
+      clear: async (sessionID) => { cleared.push(sessionID) },
+    }
+    handleSessionCreated(evt("session.created", { sessionID: "ses_1", agent: "build" }), ctx)
+    handleExecutionStarted(evt("session.execution.started", { sessionID: "ses_1" }), ctx)
+    ctx.tracing.sessionToolsets.set("ses_1", { hash: "h", tools: ["read"] })
+    ctx.tracing.sessionModels.set("ses_1", new Set(["m"]))
+    ctx.tracing.turnOutputs.set("ses_1", "output")
+    ctx.tracing.pendingPrompts.set("ses_1", [])
+    ctx.tracing.activeExecutions.add("ses_1")
+
+    await handleSessionDeleted(evt("session.deleted", { sessionID: "ses_1" }, 3000), ctx)
+
+    const run = tracer.spans.find((s) => s.name === "opencode.session")!
+    expect(run.ended).toBe(true)
+    expect(run.attributes["session.deleted"]).toBe(true)
+    expect(ctx.tracing.sessionTotals.has("ses_1")).toBe(false)
+    expect(ctx.tracing.sessionIdentity.has("ses_1")).toBe(false)
+    expect(ctx.tracing.sessionToolsets.has("ses_1")).toBe(false)
+    expect(ctx.tracing.sessionModels.has("ses_1")).toBe(false)
+    expect(ctx.tracing.turnOutputs.has("ses_1")).toBe(false)
+    expect(ctx.tracing.pendingPrompts.has("ses_1")).toBe(false)
+    expect(ctx.tracing.activeExecutions.has("ses_1")).toBe(false)
+    expect(ctx.tracing.runSpans.has("ses_1")).toBe(false)
+    expect(cleared).toEqual(["ses_1"])
+  })
+
+  test("clears restored step contexts for the deleted session", async () => {
+    const { ctx } = makeCtx()
+    ctx.tracing.restoredStepContexts.set("msg_1", {
+      sessionID: "ses_1",
+      spanContext: { traceId: "0".repeat(31) + "1", spanId: "0".repeat(15) + "1", traceFlags: 1 },
+    })
+    ctx.tracing.restoredStepContexts.set("msg_2", {
+      sessionID: "ses_2",
+      spanContext: { traceId: "0".repeat(31) + "2", spanId: "0".repeat(15) + "2", traceFlags: 1 },
+    })
+    await handleSessionDeleted(evt("session.deleted", { sessionID: "ses_1" }), ctx)
+    expect(ctx.tracing.restoredStepContexts.has("msg_1")).toBe(false)
+    expect(ctx.tracing.restoredStepContexts.has("msg_2")).toBe(true)
+  })
+})
+
+describe("finalizeOnShutdown", () => {
+  test("ends open run spans so the trace is exported before the instance unloads", () => {
+    const { ctx, tracer } = makeCtx()
+    handleSessionCreated(evt("session.created", { sessionID: "ses_1", agent: "build" }), ctx)
+    handleExecutionStarted(evt("session.execution.started", { sessionID: "ses_1" }), ctx)
+    finalizeOnShutdown(ctx)
+    const run = tracer.spans.find((s) => s.name === "opencode.session")!
+    expect(run.ended).toBe(true)
+    expect(run.attributes["session.interrupted_reason"]).toBe("plugin stopped")
+    expect(ctx.tracing.runSpans.size).toBe(0)
   })
 })

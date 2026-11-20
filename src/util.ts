@@ -199,7 +199,7 @@ export function resolveRunContext(sessionID: string, ctx: HandlerContext): Conte
   const base = ctx.rootContext()
   const span = ctx.tracing.runSpans.get(sessionID)
   if (span) return trace.setSpan(base, span)
-  const spanContext = ctx.tracing.runSpanContexts.get(sessionID)
+  const spanContext = ctx.tracing.runSpanContexts.get(sessionID) ?? ctx.tracing.restoredRunContexts.get(sessionID)
   return spanContext ? trace.setSpanContext(base, spanContext) : base
 }
 
@@ -208,8 +208,36 @@ export function resolveStepContext(sessionID: string, assistantMessageID: string
   const parent = resolveRunContext(sessionID, ctx)
   const span = ctx.tracing.stepSpans.get(assistantMessageID)
   if (span) return trace.setSpan(parent, span)
-  const spanContext = ctx.tracing.stepSpanContexts.get(assistantMessageID)
+  const spanContext = ctx.tracing.stepSpanContexts.get(assistantMessageID) ?? ctx.tracing.restoredStepContexts.get(assistantMessageID)?.spanContext
   return spanContext ? trace.setSpanContext(parent, spanContext) : parent
+}
+
+/**
+ * Restores the run/step span context persisted by a previous plugin instance, once per
+ * session. A plugin reload (config change, project switch) recreates the instance while a
+ * turn is still running; without this the remaining spans of that turn would start a new
+ * trace instead of joining the exported one.
+ */
+export function restoreSessionTraceContext(sessionID: string, ctx: HandlerContext): Promise<void> {
+  const store = ctx.traceStore
+  if (!store) return Promise.resolve()
+  const existing = ctx.tracing.restorePromises.get(sessionID)
+  if (existing) return existing
+  const pending = (async () => {
+    const restored = await store.load(sessionID)
+    if (!restored) return
+    if (restored.run && !ctx.tracing.runSpanContexts.has(sessionID)) {
+      setBoundedMap(ctx.tracing.restoredRunContexts, sessionID, restored.run)
+    }
+    if (restored.step && !ctx.tracing.stepSpanContexts.has(restored.step.messageID)) {
+      setBoundedMap(ctx.tracing.restoredStepContexts, restored.step.messageID, {
+        sessionID,
+        spanContext: restored.step.spanContext,
+      })
+    }
+  })()
+  setBoundedMap(ctx.tracing.restorePromises, sessionID, pending)
+  return pending
 }
 
 /**
@@ -263,21 +291,34 @@ export function eventContext(spanContext: SpanContext | undefined): Context | un
  * session's own run, or the parent run for a subagent session that has not started.
  */
 export function sessionSpanContext(sessionID: string, ctx: HandlerContext): SpanContext | undefined {
-  const own = ctx.tracing.runSpanContexts.get(sessionID)
+  const own = ctx.tracing.runSpanContexts.get(sessionID) ?? ctx.tracing.restoredRunContexts.get(sessionID)
   if (own) return own
   const parentID = ctx.tracing.sessionIdentity.get(sessionID)?.parentID
-  return parentID ? ctx.tracing.runSpanContexts.get(parentID) : undefined
+  return parentID ? ctx.tracing.runSpanContexts.get(parentID) ?? ctx.tracing.restoredRunContexts.get(parentID) : undefined
+}
+
+/** Maximum characters retained for the assistant text of one execution. */
+const TURN_OUTPUT_LIMIT = 64_000
+
+/** Appends assistant text to the current execution output, bounded for memory safety. */
+export function appendTurnOutput(sessionID: string, text: string, ctx: HandlerContext): void {
+  if (!text) return
+  const current = ctx.tracing.turnOutputs.get(sessionID) ?? ""
+  if (current.length >= TURN_OUTPUT_LIMIT) return
+  const next = current ? `${current}\n${text}` : text
+  setBoundedMap(ctx.tracing.turnOutputs, sessionID, next.slice(0, TURN_OUTPUT_LIMIT))
 }
 
 /** Resolves the current session-scoped agent name/type, defaulting to `unknown` when unavailable. */
 export function getSessionAgentMeta(
   sessionID: string,
   ctx: HandlerContext,
-): { agentName: string; agentType: SessionAgentType | "unknown" } {
+): { agentName: string; agentType: SessionAgentType | "unknown"; agentVersion: string | undefined } {
   const totals = ctx.tracing.sessionTotals.get(sessionID)
   return {
     agentName: totals?.agent ?? "unknown",
     agentType: totals?.agentType ?? "unknown",
+    agentVersion: totals?.agentVersion,
   }
 }
 

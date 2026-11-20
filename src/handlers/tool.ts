@@ -1,7 +1,8 @@
 import { SeverityNumber } from "@opentelemetry/api-logs"
 import { SpanKind, SpanStatusCode } from "@opentelemetry/api"
 import type { EventOf, HandlerContext, ToolFacts, ToolMeta } from "../types.ts"
-import { GEN_AI_METRIC, errorAttrs, signalAttrs, toolCallAttrs, toolDurationAttrs, toolEndAttrs, toolFactsAttrs, toolSpanName, toolStartAttrs } from "../semconv.ts"
+import { GEN_AI_METRIC, OPENCODE_ATTR, errorAttrs, signalAttrs, toolCallAttrs, toolDurationAttrs, toolEndAttrs, toolFactsAttrs, toolSpanName, toolStartAttrs } from "../semconv.ts"
+import { exitCodeOf, sha256Hex, toolSemantics, toolSemanticsAttrs } from "../facts.ts"
 import {
   currentTurnID,
   errorSummary,
@@ -124,6 +125,9 @@ export function handleToolCalled(e: EventOf<"session.tool.called">, ctx: Handler
   }
   const isSubagent = meta.tool === "subagent"
   const facts = ctx.captureToolFacts ? toolFacts(meta.tool, d.input) : undefined
+  const inputJson = safeJson(d.input)
+  const argsHash = inputJson ? sha256Hex(inputJson) : undefined
+  const semantics = toolSemantics(meta.tool, d.input)
   setBoundedMap(ctx.tracing.toolMeta, d.id, {
     ...meta,
     startMs: e.created,
@@ -131,6 +135,8 @@ export function handleToolCalled(e: EventOf<"session.tool.called">, ctx: Handler
     ...(isSubagent && typeof d.input["agent"] === "string" ? { agent: d.input["agent"] } : {}),
     ...(typeof d.input["command"] === "string" ? { command: d.input["command"] } : {}),
     ...(facts ? { toolFacts: facts } : {}),
+    ...(argsHash ? { argsHash } : {}),
+    ...(Object.keys(semantics).length ? { semantics } : {}),
   })
 
   if (!isTraceEnabled("tool", ctx)) return
@@ -158,13 +164,16 @@ export function handleToolCalled(e: EventOf<"session.tool.called">, ctx: Handler
     setBoundedMap(ctx.tracing.toolSpanContexts, d.id, span.spanContext())
   }
 
-  const { agentName, agentType } = getSessionAgentMeta(d.sessionID, ctx)
+  const { agentName, agentType, agentVersion } = getSessionAgentMeta(d.sessionID, ctx)
   ctx.tracing.toolSpans.get(d.id)?.setAttributes(toolCallAttrs(ctx.semconv, {
     agent: agentName,
     agentType,
+    agentVersion,
     inputJson: ctx.captureContent ? safeJson(d.input) : undefined,
     providerExecuted: isProviderExecuted(d),
     ...(facts ? { facts } : {}),
+    ...(argsHash ? { argsHash } : {}),
+    semantics,
   }))
 }
 
@@ -182,7 +191,7 @@ function startSubagentSpan(callID: string, ctx: HandlerContext) {
   if (!meta || meta.tool !== "subagent") return
   setBoundedMap(ctx.tracing.toolMeta, callID, { ...meta, executionStarted: true })
   if (ctx.tracing.toolSpans.has(callID) || !isTraceEnabled("tool", ctx)) return
-  const { agentName, agentType } = getSessionAgentMeta(meta.sessionID, ctx)
+  const { agentName, agentType, agentVersion } = getSessionAgentMeta(meta.sessionID, ctx)
   const span = ctx.tracer.startSpan(
     toolSpanName(ctx.semconv, "subagent", ctx.tracePrefix),
     {
@@ -195,6 +204,7 @@ function startSubagentSpan(callID: string, ctx: HandlerContext) {
           callID,
           agent: agentName,
           agentType,
+          agentVersion,
           subagent: meta.agent ?? "unknown",
           parentToolCallID: callID,
           ...(meta.turnID ? { turnID: meta.turnID } : {}),
@@ -228,14 +238,14 @@ export function handleToolProgress(e: EventOf<"session.tool.progress">, ctx: Han
 export function handleToolSuccess(e: EventOf<"session.tool.success">, ctx: HandlerContext) {
   linkSubagent(e.data.id, e.data.metadata?.["sessionID"], ctx)
   const output = contentText(e.data.content)
-  finishTool(e.data.id, e.data.sessionID, e.created, true, output, undefined, ctx)
+  finishTool(e.data.id, e.data.sessionID, e.created, true, output, undefined, e.data.metadata, ctx)
 }
 
 /** Ends a failed tool call: records duration, sets error attributes, and emits `tool_result`. */
 export function handleToolFailed(e: EventOf<"session.tool.failed">, ctx: HandlerContext) {
   linkSubagent(e.data.id, e.data.metadata?.["sessionID"], ctx)
   const output = contentText(e.data.content)
-  finishTool(e.data.id, e.data.sessionID, e.created, false, output, e.data.error, ctx)
+  finishTool(e.data.id, e.data.sessionID, e.created, false, output, e.data.error, e.data.metadata, ctx)
 }
 
 function finishTool(
@@ -245,6 +255,7 @@ function finishTool(
   success: boolean,
   output: string,
   error: StructuredError | undefined,
+  metadata: Record<string, unknown> | undefined,
   ctx: HandlerContext,
 ) {
   const meta = ctx.tracing.toolMeta.get(callID)
@@ -254,8 +265,10 @@ function finishTool(
   const observedExecution = meta?.executionStarted === true
   const start = observedExecution ? meta.startMs : endMs
   const durationMs = Math.max(0, endMs - start)
-  const { agentName, agentType } = getSessionAgentMeta(sessionID, ctx)
+  const { agentName, agentType, agentVersion } = getSessionAgentMeta(sessionID, ctx)
   const sizeBytes = output ? Buffer.byteLength(output, "utf8") : 0
+  const resultHash = output ? sha256Hex(output) : undefined
+  const exitCode = exitCodeOf(metadata)
 
   if (success && observedExecution && meta.command && SHELL_TOOL_RE.test(tool) && GIT_COMMIT_RE.test(meta.command)) {
     if (isMetricEnabled("commit.count", ctx)) {
@@ -269,7 +282,7 @@ function finishTool(
       body: "commit",
       attributes: {
         "event.name": "commit",
-        ...signalAttrs(ctx.semconv, { sessionID, agent: agentName, agentType }),
+        ...signalAttrs(ctx.semconv, { sessionID, agent: agentName, agentType, agentVersion }),
         ...ctx.commonAttrs,
       },
     }, spanContext)
@@ -279,7 +292,7 @@ function finishTool(
     if (isMetricEnabled(GEN_AI_METRIC.executeToolDuration, ctx)) {
       ctx.instruments.executeToolDurationHistogram.record(durationMs / 1000, {
         ...ctx.commonAttrs,
-        ...toolDurationAttrs({ sessionID, tool, agent: agentName, agentType, success, errorType: error?.type }),
+        ...toolDurationAttrs({ sessionID, tool, agent: agentName, agentType, agentVersion, success, errorType: error?.type }),
       })
     }
   } else if (observedExecution && isMetricEnabled("tool.duration", ctx)) {
@@ -295,8 +308,11 @@ function finishTool(
     span.setAttributes(toolEndAttrs(ctx.semconv, {
       agent: agentName,
       agentType,
+      agentVersion,
       success,
       sizeBytes,
+      ...(resultHash ? { resultHash } : {}),
+      ...(exitCode !== undefined ? { exitCode } : {}),
       ...(output && ctx.captureContent ? { output } : {}),
       ...(success ? {} : { error }),
     }))
@@ -318,10 +334,14 @@ function finishTool(
     body: "tool_result",
     attributes: {
       "event.name": "tool_result",
-      ...signalAttrs(ctx.semconv, { sessionID, agent: agentName, agentType, tool }),
+      ...signalAttrs(ctx.semconv, { sessionID, agent: agentName, agentType, agentVersion, tool }),
       success,
       duration_ms: durationMs,
       ...toolFactsAttrs(meta?.toolFacts),
+      ...toolSemanticsAttrs(meta?.semantics),
+      ...(meta?.argsHash ? { [OPENCODE_ATTR.toolArgsHash]: meta.argsHash } : {}),
+      ...(resultHash ? { [OPENCODE_ATTR.toolResultHash]: resultHash } : {}),
+      ...(exitCode !== undefined ? { [OPENCODE_ATTR.toolExitCode]: exitCode } : {}),
       ...(success ? { tool_result_size_bytes: sizeBytes } : { error: errorSummary(error), ...errorAttrs(error) }),
       ...ctx.commonAttrs,
     },

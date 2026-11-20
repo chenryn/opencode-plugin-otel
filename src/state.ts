@@ -22,6 +22,11 @@ export function configKey(config: PluginConfig): string {
     disabledTraces: [...config.disabledTraces].sort(),
     tracePropagationProviders: [...config.tracePropagationProviders].sort(),
     logLevel: undefined,
+    // the local event mirror never touches the OTel providers/instruments
+    localEventLog: undefined,
+    localEventLogPath: undefined,
+    // per-instance agent identity metadata, not provider configuration
+    agentVersion: undefined,
     // guard options never touch the OTel providers/instruments, so instances may
     // enable the guard per project while sharing one process-wide telemetry SDK
     guard: undefined,
@@ -135,9 +140,15 @@ export function acquireTracingState(): TracingState {
       countedMessages: new Set(),
       sessionProjects: new Map(),
       sessionIdentity: new Map(),
+      sessionToolsets: new Map(),
+      sessionModels: new Map(),
       sessionTurns: new Map(),
       sessionRetries: new Map(),
       stepOutputs: new Map(),
+      stepReasoning: new Map(),
+      turnOutputs: new Map(),
+      compactionSpans: new Map(),
+      compactionMeta: new Map(),
       pendingPrompts: new Map(),
       activePrompts: new Map(),
       activeExecutions: new Set(),
@@ -145,8 +156,20 @@ export function acquireTracingState(): TracingState {
       activeLlm: new Map(),
       provisionalLlm: new Map(),
       modelContexts: new Map(),
+      restoredRunContexts: new Map(),
+      restoredStepContexts: new Map(),
+      restorePromises: new Map(),
     }
     g[TRACING_KEY] = state
   }
+  state.sessionToolsets ??= new Map()
+  state.sessionModels ??= new Map()
+  state.stepReasoning ??= new Map()
+  state.turnOutputs ??= new Map()
+  state.compactionSpans ??= new Map()
+  state.compactionMeta ??= new Map()
+  state.restoredRunContexts ??= new Map()
+  state.restoredStepContexts ??= new Map()
+  state.restorePromises ??= new Map()
   return state
 }

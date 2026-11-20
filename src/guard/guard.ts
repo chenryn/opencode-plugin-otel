@@ -325,7 +325,7 @@ export async function setupGuard(
         const targetContext: SpanContext | undefined = callID
           ? hctx.tracing.toolSpanContexts.get(callID)
           : undefined
-        const { agentName, agentType } = getSessionAgentMeta(event.sessionID, hctx)
+        const { agentName, agentType, agentVersion } = getSessionAgentMeta(event.sessionID, hctx)
         const severity = severityFor(decision)
         hctx.emitEvent({
           severityNumber: severity.severityNumber,
@@ -348,6 +348,7 @@ export async function setupGuard(
               sessionID: event.sessionID,
               agent: agentName,
               agentType,
+              agentVersion,
               tool: event.action,
             }),
             ...(callID ? { "target.tool_call.id": callID } : {}),

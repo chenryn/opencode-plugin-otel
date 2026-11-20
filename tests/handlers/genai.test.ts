@@ -64,6 +64,8 @@ describe("gen_ai flavor end to end", () => {
     expect(llm.attributes["gen_ai.operation.name"]).toBe("chat")
     expect(llm.attributes["gen_ai.provider.name"]).toBe("anthropic")
     expect(llm.attributes["gen_ai.request.model"]).toBe("claude-sonnet")
+    expect(llm.attributes["gen_ai.agent.id"]).toBe("opencode:build")
+    expect(llm.attributes["gen_ai.agent.version"]).toBe("test")
     expect(llm.attributes["gen_ai.turn.id"]).toBe("ses_1:1")
     expect(llm.attributes["gen_ai.step.id"]).toBe("msg_1")
     expect(llm.attributes["gen_ai.usage.input_tokens"]).toBe(17)
@@ -78,6 +80,8 @@ describe("gen_ai flavor end to end", () => {
     const run = tracer.spans.find((span) => span.name === "invoke_agent build")!
     expect(run.attributes["gen_ai.operation.name"]).toBe("invoke_agent")
     expect(run.attributes["gen_ai.conversation.id"]).toBe("ses_1")
+    expect(run.attributes["gen_ai.agent.id"]).toBe("opencode:build")
+    expect(run.attributes["gen_ai.agent.version"]).toBe("test")
     expect(run.attributes["gen_ai.turn.id"]).toBe("ses_1:1")
     expect(run.attributes["gen_ai.usage.cost"]).toBe(0.25)
     expect(run.attributes["session.total_tokens"]).toBe(24)
@@ -110,6 +114,8 @@ describe("gen_ai flavor end to end", () => {
     expect(tool.attributes["gen_ai.tool.call.arguments"]).toBe('{"path":"a.ts"}')
     expect(tool.attributes["gen_ai.tool.call.result"]).toBe("file body")
     expect(tool.attributes["gen_ai.agent.name"]).toBe("build")
+    expect(tool.attributes["gen_ai.agent.id"]).toBe("opencode:build")
+    expect(tool.attributes["gen_ai.agent.version"]).toBe("test")
     assertNoOpenInferenceAttrs(tool)
   })
 
@@ -138,6 +144,7 @@ describe("gen_ai flavor end to end", () => {
     handleExecutionEnded(evt("session.execution.succeeded", { sessionID: "ses_1" }, 3000), ctx, { type: "succeeded" })
     expect(run.name).toBe("invoke_agent build")
     expect(run.attributes["gen_ai.agent.name"]).toBe("build")
+    expect(run.attributes["gen_ai.agent.id"]).toBe("opencode:build")
   })
 
   test("keeps the openinference flavor as the default", () => {
@@ -411,6 +418,8 @@ describe("gen_ai facts and truncation", () => {
     expect(span.attributes["gen_ai.tool.call.result"]).toBeUndefined()
     const result = logger.records.find((record) => record.body === "tool_result")!
     expect(result.attributes?.["tool.command"]).toBe("ls -la")
+    expect(result.attributes?.["gen_ai.agent.id"]).toBe("opencode:build")
+    expect(result.attributes?.["gen_ai.agent.version"]).toBe("test")
   })
 
   test("marks truncated content without leaking OpenInference keys", () => {

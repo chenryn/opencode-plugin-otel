@@ -1,6 +1,7 @@
 import { describe, test, expect } from "bun:test"
 import { SpanStatusCode } from "@opentelemetry/api"
 import { handleToolCalled, handleToolFailed, handleToolInputStarted, handleToolSuccess, toolFacts } from "../../src/handlers/tool.ts"
+import { sha256Hex } from "../../src/facts.ts"
 import { handleExecutionStarted, handleSessionCreated } from "../../src/handlers/session.ts"
 import { makeCtx, evt, recordSpanContext } from "../helpers.ts"
 
@@ -268,6 +269,66 @@ describe("tool facts", () => {
     const result = logger.records.find((record) => record.body === "tool_result")!
     expect(result.attributes?.["success"]).toBe(true)
     expect(result.attributes?.["file.operation"]).toBeUndefined()
+  })
+})
+
+describe("tool fingerprints and semantics", () => {
+  test("writes an argument hash without capturing the arguments", () => {
+    const { ctx, tracer } = makeCtx("proj_test", [], [], true, {}, "openinference", false, true, false)
+    seed(ctx)
+    handleToolInputStarted(inputStarted("call_1", "bash"), ctx)
+    handleToolCalled(called("call_1", { command: "ls -la" }, local), ctx)
+    handleToolSuccess(succeeded("call_1", "listing", local), ctx)
+    const span = tracer.spans.find((s) => s.name === "opencode.tool.bash")!
+    expect(span.attributes["opencode.tool.args.hash"]).toBe(sha256Hex('{"command":"ls -la"}'))
+    expect(span.attributes["input.value"]).toBeUndefined()
+    expect(span.attributes["opencode.tool.result.hash"]).toBe(sha256Hex("listing"))
+  })
+
+  test("records the destination and data source for a webfetch", () => {
+    const { ctx, tracer, logger } = makeCtx()
+    seed(ctx)
+    handleToolInputStarted(inputStarted("call_1", "webfetch"), ctx)
+    handleToolCalled(called("call_1", { url: "https://example.com/doc?token=x" }, local), ctx)
+    handleToolSuccess(succeeded("call_1", "body", local), ctx)
+    const span = tracer.spans.find((s) => s.name === "opencode.tool.webfetch")!
+    expect(span.attributes["url.domain"]).toBe("example.com")
+    expect(span.attributes["url.full"]).toBe("https://example.com/doc")
+    expect(span.attributes["gen_ai.data_source.type"]).toBe("web")
+    const result = logger.records.find((record) => record.body === "tool_result")!
+    expect(result.attributes?.["url.domain"]).toBe("example.com")
+  })
+
+  test("records the exit code from result metadata", () => {
+    const { ctx, tracer, logger } = makeCtx()
+    seed(ctx)
+    handleToolInputStarted(inputStarted("call_1", "bash"), ctx)
+    handleToolCalled(called("call_1", { command: "exit 1" }, local), ctx)
+    const event = evt("session.tool.failed", {
+      sessionID: "ses_1",
+      assistantMessageID: "msg_1",
+      id: "call_1",
+      error: { type: "tool.execution", message: "failed" },
+      content: [{ type: "text", text: "boom" }],
+      metadata: { exitCode: 1 },
+      ...local,
+    }, 1000)
+    handleToolFailed(event, ctx)
+    const span = tracer.spans.find((s) => s.name === "opencode.tool.bash")!
+    expect(span.attributes["opencode.tool.exit_code"]).toBe(1)
+    const result = logger.records.find((record) => record.body === "tool_result")!
+    expect(result.attributes?.["opencode.tool.exit_code"]).toBe(1)
+  })
+
+  test("records memory and mcp identity", () => {
+    const { ctx, tracer } = makeCtx()
+    seed(ctx)
+    handleToolInputStarted(inputStarted("call_1", "memory_save"), ctx)
+    handleToolCalled(called("call_1", { text: "x" }, local), ctx)
+    handleToolSuccess(succeeded("call_1", "ok", local), ctx)
+    const span = tracer.spans.find((s) => s.name === "opencode.tool.memory_save")!
+    expect(span.attributes["gen_ai.memory.operation"]).toBe("save")
+    expect(span.attributes["gen_ai.data_source.type"]).toBe("memory")
   })
 })
 

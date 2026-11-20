@@ -1,9 +1,10 @@
 import { SpanKind, type Span } from "@opentelemetry/api"
 import { INPUT_MIME_TYPE, INPUT_VALUE, MimeType } from "@arizeai/openinference-semantic-conventions"
 import type { HandlerContext, MessageEntry } from "../types.ts"
-import { inputMessageAttrs, llmSpanName, llmStartAttrs } from "../semconv.ts"
+import { inputMessageAttrs, llmSpanName, llmStartAttrs, snapshotAttrs } from "../semconv.ts"
+import { hashJson } from "../facts.ts"
 import { injectTraceContext } from "../trace-context.ts"
-import { isTraceEnabled, resolveRunContext, setBoundedMap } from "../util.ts"
+import { isTraceEnabled, resolveRunContext, restoreSessionTraceContext, setBoundedMap } from "../util.ts"
 
 /** The `session.hook("model.request", ...)` event shape consumed by this handler. */
 export type ModelRequestEvent = {
@@ -20,6 +21,7 @@ type ModelVisibleContextEvent = {
   model: { providerID: string; id: string }
   system: readonly unknown[]
   messages: readonly { role: string; content: readonly unknown[] }[]
+  tools?: Readonly<Record<string, unknown>>
 }
 
 function textParts(parts: readonly unknown[]): string {
@@ -38,14 +40,36 @@ export function captureModelContext(event: ModelVisibleContextEvent, ctx: Handle
     ...event.messages.slice(-12).map((message) => ({ role: message.role, content: textParts(message.content) })),
   ]
   const latestUser = entries.findLast((entry) => entry.role === "user" && entry.content)
+  const full = ctx.captureContextSnapshot
+    ? JSON.stringify({
+        system: event.system,
+        messages: event.messages,
+        ...(event.tools ? { tools: event.tools } : {}),
+      })
+    : undefined
   setBoundedMap(ctx.tracing.modelContexts, event.sessionID, {
     agent: event.agent,
     providerID: event.model.providerID,
     modelID: event.model.id,
     entries,
     ...(latestUser ? { inputValue: latestUser.content } : {}),
+    ...(full ? { full } : {}),
   })
 }
+
+/**
+ * Records a stable fingerprint of the model-visible toolset. The hash is derived from
+ * sorted tool names only, so descriptions or schemas changing do not churn the baseline key.
+ */
+export function captureToolset(event: ModelVisibleContextEvent, ctx: HandlerContext): void {
+  if (!event.tools) return
+  const tools = Object.keys(event.tools).sort()
+  if (!tools.length) return
+  setBoundedMap(ctx.tracing.sessionToolsets, event.sessionID, { hash: hashJson(tools), tools })
+}
+
+/** Maximum characters retained for the opt-in full model-visible snapshot. */
+const SNAPSHOT_LIMIT = 100_000
 
 /** Applies a matching captured request preview to its LLM span. */
 export function applyModelContext(
@@ -63,6 +87,7 @@ export function applyModelContext(
     if (ctx.semconv === "openinference" && snapshot.inputValue) {
       span.setAttributes({ [INPUT_VALUE]: snapshot.inputValue, [INPUT_MIME_TYPE]: MimeType.TEXT })
     }
+    if (snapshot.full) span.setAttributes(snapshotAttrs(ctx.semconv, snapshot.full, SNAPSHOT_LIMIT))
   }
   if (!retain) ctx.tracing.modelContexts.delete(sessionID)
 }
@@ -75,6 +100,7 @@ export async function handleModelRequest(event: ModelRequestEvent, ctx: HandlerC
   if (!propagate && !ctx.tracing.modelContexts.has(event.sessionID)) return
   if (!isTraceEnabled("llm", ctx)) return
   await ctx.tracing.eventQueue
+  await restoreSessionTraceContext(event.sessionID, ctx)
   let active = ctx.tracing.activeLlm.get(event.sessionID)
   if (!active) {
     const span = ctx.tracer.startSpan(
@@ -86,6 +112,7 @@ export async function handleModelRequest(event: ModelRequestEvent, ctx: HandlerC
           ...llmStartAttrs(ctx.semconv, {
             sessionID: event.sessionID,
             agent: event.agent,
+            agentVersion: ctx.tracing.sessionTotals.get(event.sessionID)?.agentVersion,
             providerID,
             modelID: event.model.id,
           }),

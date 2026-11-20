@@ -156,9 +156,15 @@ export function makeTracingState(): TracingState {
     countedMessages: new Set(),
     sessionProjects: new Map(),
     sessionIdentity: new Map(),
+    sessionToolsets: new Map(),
+    sessionModels: new Map(),
     sessionTurns: new Map(),
     sessionRetries: new Map(),
     stepOutputs: new Map(),
+    stepReasoning: new Map(),
+    turnOutputs: new Map(),
+    compactionSpans: new Map(),
+    compactionMeta: new Map(),
     pendingPrompts: new Map(),
     activePrompts: new Map(),
     activeExecutions: new Set(),
@@ -166,6 +172,9 @@ export function makeTracingState(): TracingState {
     activeLlm: new Map(),
     provisionalLlm: new Map(),
     modelContexts: new Map(),
+    restoredRunContexts: new Map(),
+    restoredStepContexts: new Map(),
+    restorePromises: new Map(),
   }
 }
 
@@ -221,6 +230,7 @@ export function makeCtx(
   captureContent = true,
   emitRedundantEvents = true,
   captureToolFacts = true,
+  agentVersion = "test",
 ): MockContext {
   const session = makeCounter()
   const token = makeCounter()
@@ -298,8 +308,10 @@ export function makeCtx(
     disabledMetrics: new Set(disabledMetrics),
     disabledTraces: new Set(disabledTraces),
     semconv,
+    agentVersion,
     captureContent,
     captureToolFacts,
+    captureContextSnapshot: false,
     tracer: tracer as unknown as Tracer,
     tracePrefix: "opencode.",
     rootContext: () => ROOT_CONTEXT,

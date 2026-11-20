@@ -11,6 +11,9 @@ import {
   modelRef,
   nextTurnID,
   normalizeNames,
+  resolveRunContext,
+  resolveStepContext,
+  restoreSessionTraceContext,
   sessionSpanContext,
   setBoundedMap,
   totalTokens,
@@ -155,5 +158,46 @@ describe("normalizeNames", () => {
   test("caps the entry length and list size", () => {
     expect(normalizeNames(["abcdef", "ghijkl"], 2, 3)).toEqual(["abc", "ghi"])
     expect(normalizeNames(undefined, 2, 3)).toEqual([])
+  })
+})
+
+describe("restoreSessionTraceContext", () => {
+  const runContext = { traceId: "a".repeat(32), spanId: "b".repeat(16), traceFlags: 1 }
+  const stepContext = { traceId: "a".repeat(32), spanId: "c".repeat(16), traceFlags: 1 }
+
+  test("adopts a persisted run and step context without a live span", async () => {
+    const { ctx } = makeCtx()
+    let loads = 0
+    ctx.traceStore = {
+      load: async () => { loads += 1; return { run: runContext, step: { messageID: "msg_1", spanContext: stepContext } } },
+      saveRun() {},
+      saveStep() {},
+      clear: async () => {},
+    }
+
+    await restoreSessionTraceContext("ses_1", ctx)
+    await restoreSessionTraceContext("ses_1", ctx)
+
+    expect(loads).toBe(1)
+    expect(ctx.tracing.restoredRunContexts.get("ses_1")).toEqual(runContext)
+    expect(ctx.tracing.restoredStepContexts.get("msg_1")).toEqual({ sessionID: "ses_1", spanContext: stepContext })
+    expect(trace.getSpanContext(resolveRunContext("ses_1", ctx))).toEqual(runContext)
+    expect(trace.getSpanContext(resolveStepContext("ses_1", "msg_1", ctx))).toEqual(stepContext)
+    expect(sessionSpanContext("ses_1", ctx)).toEqual(runContext)
+  })
+
+  test("prefers a live span over the persisted context", async () => {
+    const { ctx, tracer } = makeCtx()
+    ctx.traceStore = { load: async () => ({ run: runContext }), saveRun() {}, saveStep() {}, clear: async () => {} }
+    await restoreSessionTraceContext("ses_1", ctx)
+    const span = tracer.startSpan("live")
+    ctx.tracing.runSpans.set("ses_1", span as unknown as import("@opentelemetry/api").Span)
+    expect(trace.getSpanContext(resolveRunContext("ses_1", ctx))?.spanId).toBe(span.spanContext().spanId)
+  })
+
+  test("is a no-op when no trace store is configured", async () => {
+    const { ctx } = makeCtx()
+    await restoreSessionTraceContext("ses_1", ctx)
+    expect(ctx.tracing.restoredRunContexts.size).toBe(0)
   })
 })

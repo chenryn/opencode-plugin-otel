@@ -26,7 +26,9 @@ import {
   TOOL_PARAMETERS,
 } from "@arizeai/openinference-semantic-conventions"
 import type { MessageEntry, ToolFacts } from "./types.ts"
+import { toolSemanticsAttrs, type ToolSemantics } from "./facts.ts"
 import {
+  CONTENT_LIMIT,
   errorSummary,
   genAiProviderName,
   truncateContent,
@@ -86,7 +88,9 @@ export const GEN_AI_ATTR = {
   responseModel: "gen_ai.response.model",
   responseFinishReasons: "gen_ai.response.finish_reasons",
   conversationID: "gen_ai.conversation.id",
+  agentID: "gen_ai.agent.id",
   agentName: "gen_ai.agent.name",
+  agentVersion: "gen_ai.agent.version",
   inputMessages: "gen_ai.input.messages",
   outputMessages: "gen_ai.output.messages",
   usageInputTokens: "gen_ai.usage.input_tokens",
@@ -113,6 +117,19 @@ export const GEN_AI_ATTR = {
 const OP_CHAT = "chat"
 const OP_EXECUTE_TOOL = "execute_tool"
 const OP_INVOKE_AGENT = "invoke_agent"
+
+/**
+ * Plugin extension attributes with no official semantic convention. They carry
+ * fingerprints and provenance so a backend can group without storing content.
+ */
+export const OPENCODE_ATTR = {
+  toolArgsHash: "opencode.tool.args.hash",
+  toolResultHash: "opencode.tool.result.hash",
+  toolExitCode: "opencode.tool.exit_code",
+  promptHash: "opencode.prompt.hash",
+  toolsetHash: "opencode.toolset.hash",
+  agentConfigHash: "opencode.agent.config_hash",
+} as const
 
 /**
  * Metric names from the OpenTelemetry GenAI semantic conventions emitted by the `gen_ai`
@@ -154,6 +171,7 @@ const REDUNDANT_EVENTS: ReadonlySet<string> = new Set([
   "api_error",
   "tool_result",
   "session.created",
+  "compaction",
 ])
 
 /** Returns `true` when the log event is redundant with a span and may be suppressed. */
@@ -166,6 +184,7 @@ export type SignalIdentity = {
   sessionID?: string
   agent?: string
   agentType?: string
+  agentVersion?: string
   modelID?: string
   providerID?: string
   tool?: string
@@ -187,7 +206,7 @@ export function signalAttrs(flavor: SemconvFlavor, input: SignalIdentity): Attri
       : input.providerID
   }
   if (input.agent) {
-    if (flavor === "gen_ai") attrs[GEN_AI_ATTR.agentName] = input.agent
+    if (flavor === "gen_ai") Object.assign(attrs, agentNameAttrs(flavor, input.agent, input.agentVersion))
     else {
       attrs["agent"] = input.agent
       attrs[AGENT_NAME] = input.agent
@@ -225,6 +244,10 @@ export function withTokenModality(attrs: Attributes, modality: string): Attribut
  * the `openinference` flavor keeps `cost_usd` for existing dashboards.
  */
 export function costAttrs(flavor: SemconvFlavor, cost: number): Attributes {
+  // A provider that reports `0` is reporting "unknown", not "free": custom proxies and local
+  // models frequently carry no pricing. Omitting the attribute lets a backend with its own
+  // model pricing fill the value in instead of displaying a real request as $0.
+  if (!(cost > 0)) return {}
   return flavor === "gen_ai" ? { [GEN_AI_ATTR.usageCost]: cost } : { cost_usd: cost }
 }
 
@@ -262,9 +285,28 @@ export function retryAttrs(input: RetryInput): Attributes {
   }
 }
 
+/**
+ * Stable application-defined id for an OpenCode agent role.
+ *
+ * OpenAI agent ids are provider-assigned resource ids; OpenCode has no such registry,
+ * so the agent name is the stable role identity across sessions. `unknown` is an
+ * unresolved lookup, not an agent, and must not become an id.
+ */
+export function agentStableID(agent: string | undefined): string | undefined {
+  const name = agent?.trim()
+  if (!name || name.toLowerCase() === "unknown") return undefined
+  return `opencode:${name}`
+}
+
 /** Agent identity attributes for the active flavor. */
-function agentNameAttrs(flavor: SemconvFlavor, agent: string): Attributes {
-  return flavor === "gen_ai" ? { [GEN_AI_ATTR.agentName]: agent } : { [AGENT_NAME]: agent }
+function agentNameAttrs(flavor: SemconvFlavor, agent: string, agentVersion?: string): Attributes {
+  if (flavor === "openinference") return { [AGENT_NAME]: agent }
+  const id = agentStableID(agent)
+  return {
+    [GEN_AI_ATTR.agentName]: agent,
+    ...(id ? { [GEN_AI_ATTR.agentID]: id } : {}),
+    ...(agentVersion ? { [GEN_AI_ATTR.agentVersion]: agentVersion } : {}),
+  }
 }
 
 /** Session/conversation identity attributes for the active flavor. */
@@ -330,15 +372,20 @@ export function promptAttrs(flavor: SemconvFlavor, text: string): Attributes {
 }
 
 /** Attributes for the assistant output of a completed or failed LLM request. */
-export function outputAttrs(flavor: SemconvFlavor, text: string, finishReason?: string): Attributes {
+export function outputAttrs(flavor: SemconvFlavor, text: string, finishReason?: string, reasoning?: string): Attributes {
   const value = truncateContent(text)
+  const reasoningAttrs = reasoningContentAttrs(reasoning)
   if (flavor === "gen_ai") {
     return {
       [GEN_AI_ATTR.outputMessages]: JSON.stringify([{
         role: "assistant",
-        parts: [{ type: "text", content: value.text }],
+        parts: [
+          ...(reasoning ? [{ type: "reasoning", content: truncateContent(reasoning).text }] : []),
+          { type: "text", content: value.text },
+        ],
         ...(finishReason ? { finish_reason: finishReason } : {}),
       }]),
+      ...reasoningAttrs,
       ...truncationAttrs("content.output", value),
     }
   }
@@ -346,12 +393,49 @@ export function outputAttrs(flavor: SemconvFlavor, text: string, finishReason?: 
     [OUTPUT_VALUE]: value.text,
     [OUTPUT_MIME_TYPE]: MimeType.TEXT,
     [LLM_OUTPUT_MESSAGES]: JSON.stringify([{ role: "assistant", content: value.text }]),
+    ...reasoningAttrs,
     ...truncationAttrs("content.output", value),
   }
 }
 
-/** Attributes for partial assistant output on a failed request; no finish reason is known. */
-function failureOutputAttrs(flavor: SemconvFlavor, text: string): Attributes {
+/**
+ * Reasoning text is not a first-class field in either dialect's assistant message shape, so it
+ * travels in a plugin extension attribute; the `gen_ai` flavor also carries it as a `reasoning`
+ * part of the output message.
+ */
+function reasoningContentAttrs(reasoning: string | undefined): Attributes {
+  if (!reasoning) return {}
+  const value = truncateContent(reasoning)
+  return { "content.reasoning": value.text, ...truncationAttrs("content.reasoning", value) }
+}
+
+/** Attributes for a partial assistant output on a failed request; no finish reason is known. */
+function failureOutputAttrs(flavor: SemconvFlavor, text: string, reasoning?: string): Attributes {
+  const value = truncateContent(text)
+  const reasoningAttrs = reasoningContentAttrs(reasoning)
+  if (flavor === "gen_ai") {
+    return {
+      [GEN_AI_ATTR.outputMessages]: JSON.stringify([{
+        role: "assistant",
+        parts: [
+          ...(reasoning ? [{ type: "reasoning", content: truncateContent(reasoning).text }] : []),
+          { type: "text", content: value.text },
+        ],
+      }]),
+      ...reasoningAttrs,
+      ...truncationAttrs("content.output", value),
+    }
+  }
+  return {
+    [OUTPUT_VALUE]: value.text,
+    [OUTPUT_MIME_TYPE]: MimeType.TEXT,
+    ...reasoningAttrs,
+    ...truncationAttrs("content.output", value),
+  }
+}
+
+/** Attributes for the final assistant text of an execution (run span output). */
+export function agentOutputAttrs(flavor: SemconvFlavor, text: string): Attributes {
   const value = truncateContent(text)
   if (flavor === "gen_ai") {
     return {
@@ -362,11 +446,47 @@ function failureOutputAttrs(flavor: SemconvFlavor, text: string): Attributes {
   return { [OUTPUT_VALUE]: value.text, [OUTPUT_MIME_TYPE]: MimeType.TEXT, ...truncationAttrs("content.output", value) }
 }
 
+/**
+ * Full model-visible context attached to an LLM span. OpenInference carries it as the span
+ * input (`input.value` with a JSON mime type); the GenAI conventions have no single JSON
+ * input field, so it travels in the `content.snapshot` extension and the message list stays
+ * spec-shaped.
+ */
+export function snapshotAttrs(flavor: SemconvFlavor, snapshot: string, limit = CONTENT_LIMIT): Attributes {
+  const value = truncateContent(snapshot, limit)
+  if (flavor === "gen_ai") {
+    return { "content.snapshot": value.text, ...truncationAttrs("content.snapshot", value) }
+  }
+  return { [INPUT_VALUE]: value.text, [INPUT_MIME_TYPE]: MimeType.JSON, ...truncationAttrs("content.snapshot", value) }
+}
+
+/** End attributes for a context compaction span; neither dialect models compaction itself. */
+export function compactionAttrs(
+  flavor: SemconvFlavor,
+  input: { reason: string; durationMs: number; tokens?: TokenInfo; cost?: number; output?: string },
+): Attributes {
+  const attrs: Attributes = { "compaction.reason": input.reason, duration_ms: input.durationMs }
+  if (input.tokens) {
+    if (flavor === "gen_ai") {
+      Object.assign(attrs, genAiUsageAttrs(input.tokens))
+    } else {
+      attrs[LLM_TOKEN_COUNT_PROMPT] = input.tokens.input
+      attrs[LLM_TOKEN_COUNT_COMPLETION] = input.tokens.output
+      attrs[LLM_TOKEN_COUNT_TOTAL] = input.tokens.input + input.tokens.output + input.tokens.reasoning
+        + input.tokens.cache.read + input.tokens.cache.write
+    }
+  }
+  Object.assign(attrs, costAttrs(flavor, input.cost ?? 0))
+  if (input.output) Object.assign(attrs, outputAttrs(flavor, input.output))
+  return attrs
+}
+
 /** Start attributes for a run (agent) span. */
 export type AgentSpanInput = {
   sessionID: string
   agent: string
   agentType: string
+  agentVersion?: string
   isSubagent: boolean
   /** Plugin extension: execution sequence inside the session, emitted in `gen_ai` only. */
   turnID?: string
@@ -376,6 +496,10 @@ export type AgentSpanInput = {
   parentToolCallID?: string
   /** Skill names hit by the prompt that started this run, emitted in both flavors. */
   skillNames?: readonly string[]
+  /** Plugin extension: SHA-256 of the prompt text, emitted in both flavors. */
+  promptHash?: string
+  /** Plugin extension: model-visible toolset fingerprint, when already known. */
+  toolsetHash?: string
   promptText?: string
 }
 
@@ -383,7 +507,7 @@ export type AgentSpanInput = {
 export function agentStartAttrs(flavor: SemconvFlavor, input: AgentSpanInput): Attributes {
   const shared = {
     ...conversationAttrs(flavor, input.sessionID),
-    ...agentNameAttrs(flavor, input.agent),
+    ...agentNameAttrs(flavor, input.agent, input.agentVersion),
     "agent.type": input.agentType,
     "session.is_subagent": input.isSubagent,
     ...(input.parentSessionID ? { "parent_session_id": input.parentSessionID } : {}),
@@ -393,6 +517,8 @@ export function agentStartAttrs(flavor: SemconvFlavor, input: AgentSpanInput): A
   return {
     ...(flavor === "gen_ai" ? { [GEN_AI_ATTR.operationName]: OP_INVOKE_AGENT } : { [OPENINFERENCE_SPAN_KIND]: OpenInferenceSpanKind.AGENT }),
     ...shared,
+    ...(input.promptHash ? { [OPENCODE_ATTR.promptHash]: input.promptHash } : {}),
+    ...(input.toolsetHash ? { [OPENCODE_ATTR.toolsetHash]: input.toolsetHash } : {}),
     ...(flavor === "gen_ai" && input.turnID ? { [GEN_AI_ATTR.turnID]: input.turnID } : {}),
     ...(input.promptText ? promptAttrs(flavor, input.promptText) : {}),
   }
@@ -402,18 +528,25 @@ export function agentStartAttrs(flavor: SemconvFlavor, input: AgentSpanInput): A
 export type AgentTotals = {
   agent: string
   agentType: string
+  agentVersion?: string
   tokens: number
   cost: number
   messages: number
+  /** Plugin extension: SHA-256 of the agent role, toolset, and observed models. */
+  configHash?: string
+  /** Plugin extension: latest model-visible toolset fingerprint. */
+  toolsetHash?: string
 }
 
 /** Returns the session totals attached to a run span when its execution ends. */
 export function agentEndAttrs(flavor: SemconvFlavor, totals: AgentTotals): Attributes {
   return {
-    ...agentNameAttrs(flavor, totals.agent),
+    ...agentNameAttrs(flavor, totals.agent, totals.agentVersion),
     "agent.type": totals.agentType,
     "session.total_tokens": totals.tokens,
     "session.total_cost_usd": totals.cost,
+    ...(totals.configHash ? { [OPENCODE_ATTR.agentConfigHash]: totals.configHash } : {}),
+    ...(totals.toolsetHash ? { [OPENCODE_ATTR.toolsetHash]: totals.toolsetHash } : {}),
     ...(flavor === "gen_ai" ? costAttrs(flavor, totals.cost) : {}),
     "session.total_messages": totals.messages,
   }
@@ -424,12 +557,15 @@ export type LlmSpanInput = {
   sessionID: string
   agent: string
   agentType?: string
+  agentVersion?: string
   providerID: string
   modelID: string
   /** Plugin extension: execution sequence inside the session, emitted in `gen_ai` only. */
   turnID?: string
   /** Plugin extension: assistant message id for this step, emitted in `gen_ai` only. */
   stepID?: string
+  /** Plugin extension: model-visible toolset fingerprint. */
+  toolsetHash?: string
   promptText?: string
 }
 
@@ -438,7 +574,7 @@ export function llmStartAttrs(flavor: SemconvFlavor, input: LlmSpanInput): Attri
   const provider = genAiProviderName(input.providerID)
   const shared = {
     ...conversationAttrs(flavor, input.sessionID),
-    ...agentNameAttrs(flavor, input.agent),
+    ...agentNameAttrs(flavor, input.agent, input.agentVersion),
     ...(input.agentType ? { "agent.type": input.agentType } : {}),
   }
   if (flavor === "gen_ai") {
@@ -450,6 +586,7 @@ export function llmStartAttrs(flavor: SemconvFlavor, input: LlmSpanInput): Attri
       [GEN_AI_ATTR.responseModel]: input.modelID,
       ...(input.turnID ? { [GEN_AI_ATTR.turnID]: input.turnID } : {}),
       ...(input.stepID ? { [GEN_AI_ATTR.stepID]: input.stepID } : {}),
+      ...(input.toolsetHash ? { [OPENCODE_ATTR.toolsetHash]: input.toolsetHash } : {}),
       ...(input.promptText ? promptAttrs(flavor, input.promptText) : {}),
     }
   }
@@ -460,6 +597,7 @@ export function llmStartAttrs(flavor: SemconvFlavor, input: LlmSpanInput): Attri
     [LLM_PROVIDER]: input.providerID,
     [GEN_AI_ATTR.providerName]: provider,
     [LLM_MODEL_NAME]: input.modelID,
+    ...(input.toolsetHash ? { [OPENCODE_ATTR.toolsetHash]: input.toolsetHash } : {}),
     ...(input.promptText ? promptAttrs(flavor, input.promptText) : {}),
   }
 }
@@ -468,12 +606,15 @@ export function llmStartAttrs(flavor: SemconvFlavor, input: LlmSpanInput): Attri
 type LlmUsageInput = {
   agent: string
   agentType: string
+  agentVersion?: string
   tokens: TokenInfo
   cost: number
   finish?: string
   durationMs: number
   ttftMs?: number
   output?: string
+  /** Reasoning text streamed before the visible answer. */
+  reasoning?: string
 }
 
 /** End attributes for a completed LLM request span. */
@@ -483,6 +624,7 @@ export type LlmResultInput = LlmUsageInput
 export type LlmFailureInput = {
   agent: string
   agentType: string
+  agentVersion?: string
   tokens?: TokenInfo
   cost?: number
   finish?: string
@@ -490,6 +632,8 @@ export type LlmFailureInput = {
   durationMs: number
   ttftMs?: number
   output?: string
+  /** Reasoning text streamed before the failure. */
+  reasoning?: string
 }
 
 /** GenAI usage attributes; cache tokens are folded into the input total, as OpenAI reports them. */
@@ -513,11 +657,11 @@ function ttftAttrs(flavor: SemconvFlavor, ttftMs: number | undefined): Attribute
 /** Returns the end attributes for a completed LLM request span. */
 export function llmEndAttrs(flavor: SemconvFlavor, input: LlmResultInput): Attributes {
   const shared = {
-    ...agentNameAttrs(flavor, input.agent),
+    ...agentNameAttrs(flavor, input.agent, input.agentVersion),
     "agent.type": input.agentType,
     ...ttftAttrs(flavor, input.ttftMs),
     duration_ms: input.durationMs,
-    ...(input.output ? outputAttrs(flavor, input.output, input.finish) : {}),
+    ...(input.output || input.reasoning ? outputAttrs(flavor, input.output ?? "", input.finish, input.reasoning) : {}),
   }
   if (flavor === "gen_ai") {
     return {
@@ -536,7 +680,7 @@ export function llmEndAttrs(flavor: SemconvFlavor, input: LlmResultInput): Attri
     [LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_WRITE]: input.tokens.cache.write,
     [LLM_TOKEN_COUNT_TOTAL]: input.tokens.input + input.tokens.output + input.tokens.reasoning + input.tokens.cache.read + input.tokens.cache.write,
     [LLM_FINISH_REASON]: input.finish,
-    [LLM_COST_TOTAL]: input.cost,
+    ...(input.cost > 0 ? { [LLM_COST_TOTAL]: input.cost } : {}),
     ...costAttrs(flavor, input.cost),
   }
 }
@@ -548,12 +692,12 @@ export function llmEndAttrs(flavor: SemconvFlavor, input: LlmResultInput): Attri
 export function llmFailAttrs(flavor: SemconvFlavor, input: LlmFailureInput): Attributes {
   const finishReason = input.finish ?? "error"
   const shared = {
-    ...agentNameAttrs(flavor, input.agent),
+    ...agentNameAttrs(flavor, input.agent, input.agentVersion),
     "agent.type": input.agentType,
     duration_ms: input.durationMs,
     ...ttftAttrs(flavor, input.ttftMs),
     ...errorAttrs(input.error),
-    ...(input.output ? failureOutputAttrs(flavor, input.output) : {}),
+    ...(input.output || input.reasoning ? failureOutputAttrs(flavor, input.output ?? "", input.reasoning) : {}),
   }
   if (flavor === "gen_ai") {
     return {
@@ -574,7 +718,7 @@ export function llmFailAttrs(flavor: SemconvFlavor, input: LlmFailureInput): Att
       [LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_WRITE]: input.tokens.cache.write,
       [LLM_TOKEN_COUNT_TOTAL]: input.tokens.input + input.tokens.output + input.tokens.reasoning + input.tokens.cache.read + input.tokens.cache.write,
     } : {}),
-    ...(input.cost !== undefined ? { [LLM_COST_TOTAL]: input.cost, ...costAttrs(flavor, input.cost) } : {}),
+    ...(input.cost !== undefined && input.cost > 0 ? { [LLM_COST_TOTAL]: input.cost, ...costAttrs(flavor, input.cost) } : {}),
   }
 }
 
@@ -585,6 +729,7 @@ export type ToolSpanInput = {
   callID: string
   agent?: string
   agentType?: string
+  agentVersion?: string
   subagent?: string
   /** Plugin extension: inherited turn id, emitted in `gen_ai` only. */
   turnID?: string
@@ -601,7 +746,7 @@ export type ToolSpanInput = {
 export function toolStartAttrs(flavor: SemconvFlavor, input: ToolSpanInput): Attributes {
   const shared = {
     ...conversationAttrs(flavor, input.sessionID),
-    ...(input.agent ? agentNameAttrs(flavor, input.agent) : {}),
+    ...(input.agent ? agentNameAttrs(flavor, input.agent, input.agentVersion) : {}),
     ...(input.agentType ? { "agent.type": input.agentType } : {}),
     ...(input.subagent ? { "subagent.agent": input.subagent } : {}),
     ...(input.parentToolCallID ? { "parent_tool_call_id": input.parentToolCallID } : {}),
@@ -666,19 +811,26 @@ export function toolFactsAttrs(facts: ToolFacts | undefined): Attributes {
 export type ToolCallInput = {
   agent: string
   agentType: string
+  agentVersion?: string
   inputJson?: string
   providerExecuted: boolean
   facts?: ToolFacts
+  /** Plugin extension: SHA-256 of the serialized arguments. */
+  argsHash?: string
+  /** Attachment and destination facts derived from the arguments. */
+  semantics?: ToolSemantics
 }
 
 /** Returns the attributes added once the tool input is known. */
 export function toolCallAttrs(flavor: SemconvFlavor, input: ToolCallInput): Attributes {
   const args = truncateContent(input.inputJson)
   const shared = {
-    ...agentNameAttrs(flavor, input.agent),
+    ...agentNameAttrs(flavor, input.agent, input.agentVersion),
     "agent.type": input.agentType,
     "tool.provider_executed": input.providerExecuted,
     ...toolFactsAttrs(input.facts),
+    ...toolSemanticsAttrs(input.semantics),
+    ...(input.argsHash ? { [OPENCODE_ATTR.toolArgsHash]: input.argsHash } : {}),
     ...truncationAttrs("tool.arguments", args),
   }
   if (!args.text) return shared
@@ -691,19 +843,26 @@ export function toolCallAttrs(flavor: SemconvFlavor, input: ToolCallInput): Attr
 export type ToolResultInput = {
   agent: string
   agentType: string
+  agentVersion?: string
   success: boolean
   output?: string
   error?: StructuredError
   sizeBytes?: number
+  /** Plugin extension: SHA-256 of the tool result content. */
+  resultHash?: string
+  /** Plugin extension: process exit code when the runtime reports one. */
+  exitCode?: number
 }
 
 /** Returns the attributes added when the tool completes. */
 export function toolEndAttrs(flavor: SemconvFlavor, input: ToolResultInput): Attributes {
   const output = truncateContent(input.output)
   const shared = {
-    ...agentNameAttrs(flavor, input.agent),
+    ...agentNameAttrs(flavor, input.agent, input.agentVersion),
     "agent.type": input.agentType,
     "tool.success": input.success,
+    ...(input.resultHash ? { [OPENCODE_ATTR.toolResultHash]: input.resultHash } : {}),
+    ...(input.exitCode !== undefined ? { [OPENCODE_ATTR.toolExitCode]: input.exitCode } : {}),
     ...(input.success
       ? { "tool.result_size_bytes": input.sizeBytes ?? 0 }
       : { "tool.error": errorSummary(input.error), ...errorAttrs(input.error) }),
