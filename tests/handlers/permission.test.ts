@@ -41,6 +41,29 @@ describe("handlePermissionReplied", () => {
     expect(record.attributes?.["permission.decision"]).toBe("accept")
     expect(record.attributes?.["error.type"]).toBeUndefined()
   })
+
+  test("records how long the user took to answer", () => {
+    const { ctx, logger } = makeCtx()
+    handlePermissionAsked(evt("permission.asked", { id: "perm_4", sessionID: "ses_1", action: "bash", resources: ["git push"] }, 1_000), ctx)
+    handlePermissionReplied(evt("permission.replied", { sessionID: "ses_1", requestID: "perm_4", reply: "once" }, 3_500), ctx)
+    const record = logger.records.at(-1)!
+    expect(record.attributes?.["permission.wait_ms"]).toBe(2_500)
+  })
+
+  test("never records a negative wait when the reply precedes the prompt", () => {
+    const { ctx, logger } = makeCtx()
+    handlePermissionAsked(evt("permission.asked", { id: "perm_5", sessionID: "ses_1", action: "bash", resources: ["git push"] }, 5_000), ctx)
+    handlePermissionReplied(evt("permission.replied", { sessionID: "ses_1", requestID: "perm_5", reply: "once" }, 4_000), ctx)
+    const record = logger.records.at(-1)!
+    expect(record.attributes?.["permission.wait_ms"]).toBe(0)
+  })
+
+  test("omits the wait when the prompt was never observed", () => {
+    const { ctx, logger } = makeCtx()
+    handlePermissionReplied(evt("permission.replied", { sessionID: "ses_1", requestID: "perm_6", reply: "once" }, 3_500), ctx)
+    const record = logger.records.at(-1)!
+    expect(record.attributes?.["permission.wait_ms"]).toBeUndefined()
+  })
 })
 
 describe("permission.requested", () => {

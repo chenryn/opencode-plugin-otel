@@ -45,6 +45,8 @@ export type PendingPermission = {
   toolCallID?: string
   /** Assistant message id that requested the permission, when present. */
   messageID?: string
+  /** Epoch milliseconds at which the prompt was raised. */
+  askedAt: number
 }
 
 /** Prompt text captured on the `prompt` hook and attached to the next run span. */

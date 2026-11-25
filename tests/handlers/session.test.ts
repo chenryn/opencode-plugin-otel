@@ -261,6 +261,30 @@ describe("handleSessionStatus", () => {
     expect(run.attributes["error.status"]).toBe(429)
   })
 
+  test("emits a timestamped log event per scheduled retry", () => {
+    const { ctx, tracer, logger } = makeCtx()
+    handleSessionCreated(evt("session.created", { sessionID: "ses_1" }), ctx)
+    handleExecutionStarted(evt("session.execution.started", { sessionID: "ses_1" }), ctx)
+    for (const attempt of [1, 2]) {
+      handleRetryScheduled(evt("session.retry.scheduled", {
+        sessionID: "ses_1",
+        assistantMessageID: "m",
+        attempt,
+        at: 2,
+        error: { type: "ProviderError", message: "rate limited", status: 429 },
+      }, 2000 + attempt, `retry:${attempt}`), ctx)
+    }
+    const records = logger.records.filter((record) => record.body === "session.retry")
+    expect(records).toHaveLength(2)
+    expect(records[0]!.attributes?.["retry.attempt"]).toBe(1)
+    expect(records[0]!.attributes?.["session.retry.count"]).toBe(1)
+    expect(records[1]!.attributes?.["retry.attempt"]).toBe(2)
+    expect(records[1]!.attributes?.["session.retry.count"]).toBe(2)
+    expect(records[1]!.attributes?.["error.type"]).toBe("ProviderError")
+    expect(records[1]!.attributes?.["error.status"]).toBe(429)
+    expect(recordSpanContext(records[1]!)).toEqual(tracer.spans[0]!.spanContext())
+  })
+
   test("tolerates retries without a run span and resets the count per execution", () => {
     const { ctx, tracer } = makeCtx("proj_test", [], ["session"])
     handleSessionCreated(evt("session.created", { sessionID: "ses_1" }), ctx)

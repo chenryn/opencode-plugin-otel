@@ -357,19 +357,36 @@ export function handleRetryScheduled(e: EventOf<"session.retry.scheduled">, ctx:
   const { sessionID, attempt, error } = e.data
   const count = (ctx.tracing.sessionRetries.get(sessionID) ?? 0) + 1
   setBoundedMap(ctx.tracing.sessionRetries, sessionID, count)
+  const totals = ctx.tracing.sessionTotals.get(sessionID)
+  const identity = {
+    sessionID,
+    ...(totals ? { agent: totals.agent, agentType: totals.agentType, agentVersion: totals.agentVersion } : {}),
+  }
   if (isMetricEnabled("retry.count", ctx)) {
-    const totals = ctx.tracing.sessionTotals.get(sessionID)
     ctx.instruments.retryCounter.add(1, {
       ...ctx.commonAttrs,
-      ...signalAttrs(ctx.semconv, {
-        sessionID,
-        ...(totals ? { agent: totals.agent, agentType: totals.agentType, agentVersion: totals.agentVersion } : {}),
-      }),
+      ...signalAttrs(ctx.semconv, identity),
       ...retryAttrs({ attempt, error }),
     })
   }
   // A retry can be scheduled before the run span exists (or with run spans disabled).
   ctx.tracing.runSpans.get(sessionID)?.setAttributes(retryAttrs({ attempt, count, error }))
+  // The span attributes keep only the latest attempt, so each scheduled retry is also a
+  // timestamped log event: without it a trace graph cannot draw the retry edge or tell when
+  // retries were exhausted.
+  ctx.emitEvent({
+    severityNumber: SeverityNumber.WARN,
+    severityText: "WARN",
+    timestamp: e.created,
+    observedTimestamp: Date.now(),
+    body: "session.retry",
+    attributes: {
+      "event.name": "session.retry",
+      ...signalAttrs(ctx.semconv, identity),
+      ...retryAttrs({ attempt, count, error }),
+      ...ctx.commonAttrs,
+    },
+  }, ctx.tracing.runSpanContexts.get(sessionID) ?? sessionSpanContext(sessionID, ctx))
 }
 
 /** Handles the deprecated `session.idle` event as an idle finalization signal. */

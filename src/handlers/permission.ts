@@ -25,6 +25,7 @@ export function handlePermissionAsked(e: EventOf<"permission.asked">, ctx: Handl
     action: d.action,
     resources: d.resources,
     sessionID: d.sessionID,
+    askedAt: e.created,
     ...source,
   })
   const { agentName, agentType, agentVersion } = getSessionAgentMeta(d.sessionID, ctx)
@@ -58,6 +59,7 @@ export function handlePermissionReplied(e: EventOf<"permission.replied">, ctx: H
   const pending = ctx.tracing.pendingPermissions.get(d.requestID)
   ctx.tracing.pendingPermissions.delete(d.requestID)
   const decision = d.reply === "reject" ? "reject" : "accept"
+  const waitMs = pending ? Math.max(0, e.created - pending.askedAt) : undefined
   const { agentName, agentType, agentVersion } = getSessionAgentMeta(d.sessionID, ctx)
   const targetContext = targetSpanContext(pending?.toolCallID, ctx)
 
@@ -72,6 +74,7 @@ export function handlePermissionReplied(e: EventOf<"permission.replied">, ctx: H
       ...signalAttrs(ctx.semconv, { sessionID: d.sessionID, agent: agentName, agentType, agentVersion, tool: pending?.action ?? "unknown" }),
       ...(pending?.action ? { "permission.action": pending.action } : {}),
       ...(pending ? resourcesAttrs(ctx, pending.resources) : {}),
+      ...(waitMs !== undefined ? { "permission.wait_ms": waitMs } : {}),
       ...requestAttrs(d.requestID),
       ...targetAttrs(pending?.toolCallID, targetContext),
       decision,

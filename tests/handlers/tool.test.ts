@@ -1,7 +1,7 @@
 import { describe, test, expect } from "bun:test"
 import { SpanStatusCode } from "@opentelemetry/api"
 import { handleToolCalled, handleToolFailed, handleToolInputStarted, handleToolSuccess, toolFacts } from "../../src/handlers/tool.ts"
-import { sha256Hex } from "../../src/facts.ts"
+import { hashJson, sha256Hex } from "../../src/facts.ts"
 import { handleExecutionStarted, handleSessionCreated } from "../../src/handlers/session.ts"
 import { makeCtx, evt, recordSpanContext } from "../helpers.ts"
 
@@ -280,9 +280,23 @@ describe("tool fingerprints and semantics", () => {
     handleToolCalled(called("call_1", { command: "ls -la" }, local), ctx)
     handleToolSuccess(succeeded("call_1", "listing", local), ctx)
     const span = tracer.spans.find((s) => s.name === "opencode.tool.bash")!
-    expect(span.attributes["opencode.tool.args.hash"]).toBe(sha256Hex('{"command":"ls -la"}'))
+    expect(span.attributes["opencode.tool.args.hash"]).toBe(hashJson({ command: "ls -la" }))
     expect(span.attributes["input.value"]).toBeUndefined()
     expect(span.attributes["opencode.tool.result.hash"]).toBe(sha256Hex("listing"))
+  })
+
+  test("hashes logically identical arguments identically regardless of key order", () => {
+    const { ctx, tracer } = makeCtx("proj_test", [], [], true, {}, "openinference", false, true, false)
+    seed(ctx)
+    handleToolInputStarted(inputStarted("call_1", "read"), ctx)
+    handleToolCalled(called("call_1", { path: "/tmp/a.ts", offset: 1 }, local), ctx)
+    handleToolInputStarted(inputStarted("call_2", "read"), ctx)
+    handleToolCalled(called("call_2", { offset: 1, path: "/tmp/a.ts" }, local), ctx)
+    const hashes = tracer.spans
+      .filter((s) => s.name === "opencode.tool.read")
+      .map((s) => s.attributes["opencode.tool.args.hash"])
+    expect(hashes).toHaveLength(2)
+    expect(hashes[0]).toBe(hashes[1])
   })
 
   test("records the destination and data source for a webfetch", () => {

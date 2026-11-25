@@ -2,7 +2,7 @@ import { SeverityNumber } from "@opentelemetry/api-logs"
 import { SpanKind, SpanStatusCode } from "@opentelemetry/api"
 import type { EventOf, HandlerContext, ToolFacts, ToolMeta } from "../types.ts"
 import { GEN_AI_METRIC, OPENCODE_ATTR, errorAttrs, signalAttrs, toolCallAttrs, toolDurationAttrs, toolEndAttrs, toolFactsAttrs, toolSpanName, toolStartAttrs } from "../semconv.ts"
-import { exitCodeOf, sha256Hex, toolSemantics, toolSemanticsAttrs } from "../facts.ts"
+import { exitCodeOf, hashJson, sha256Hex, toolSemantics, toolSemanticsAttrs } from "../facts.ts"
 import {
   currentTurnID,
   errorSummary,
@@ -125,8 +125,7 @@ export function handleToolCalled(e: EventOf<"session.tool.called">, ctx: Handler
   }
   const isSubagent = meta.tool === "subagent"
   const facts = ctx.captureToolFacts ? toolFacts(meta.tool, d.input) : undefined
-  const inputJson = safeJson(d.input)
-  const argsHash = inputJson ? sha256Hex(inputJson) : undefined
+  const argsHash = argsFingerprint(d.input)
   const semantics = toolSemantics(meta.tool, d.input)
   setBoundedMap(ctx.tracing.toolMeta, d.id, {
     ...meta,
@@ -361,5 +360,14 @@ function safeJson(value: unknown): string {
     return JSON.stringify(value) ?? ""
   } catch {
     return ""
+  }
+}
+
+function argsFingerprint(value: unknown): string | undefined {
+  if (!value) return undefined
+  try {
+    return hashJson(value)
+  } catch {
+    return undefined
   }
 }

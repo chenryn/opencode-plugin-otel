@@ -120,10 +120,11 @@ The run span carries the execution's accumulated assistant text as `output.value
 | `user_prompt` | User prompt durably admitted via `session.inbox.enqueued` (`prompt_length`, `delivery`; also `prompt` when `OPENCODE_CAPTURE_PROMPT_IN_LOGS` is set) |
 | `api_request` | Completed LLM step (tokens, cost) |
 | `api_error` | Failed LLM step (structured error) |
+| `session.retry` | API retry scheduled, one record per attempt (`retry.attempt`, `session.retry.count`, structured error), tied to the run span |
 | `compaction` | Context compaction finished or failed (`duration_ms`, tokens, cost, `compaction.reason`, `success`) |
 | `tool_result` | Tool completed or errored (duration, success, output size) |
 | `permission.requested` | Permission prompt asked (`permission.action`, `permission.resources`, `request.id`, `target.tool_call.id`, `target.span.id`) |
-| `tool_decision` | Permission answered (accept/reject), with the same correlation keys; never records a policy verdict |
+| `tool_decision` | Permission answered (accept/reject), with the same correlation keys plus `permission.wait_ms` (time the approver took); never records a policy verdict |
 | `commit` | Git commit detected |
 | `subtask_invoked` | Sub-agent session created (agent and parent session id) |
 | `policy.decision` | Guard verdict per `permission.evaluate` (opt-in) |
@@ -140,6 +141,10 @@ Every failure event (`api_error`, `session.error`, `tool_result` with `success=f
 ### Facts
 
 Tool spans and `tool_result` events carry a **fact layer**, emitted even when content capture is off: `tool.command` (verbatim shell command) and `file.operation` / `file.path` / `file.paths` (`read`, `write`, `edit`, `list`, `glob`, `search`). Set `OPENCODE_CAPTURE_TOOL_FACTS=0` to suppress it when raw commands must not leave the host. The passive telemetry path writes no judgement fields; detection and enforcement belong to the opt-in [guard](./guard.md).
+
+### Fingerprints
+
+`opencode.tool.args.hash` hashes the tool arguments with recursively sorted object keys (array order is preserved), so logically identical calls hash identically no matter how the model ordered its JSON. `opencode.tool.result.hash` hashes the joined result text. Both are emitted whether or not content capture is on, which is what lets a backend detect argument-stable and result-stable loops without reading payloads. `opencode.prompt.hash`, `opencode.toolset.hash`, and `opencode.agent.config_hash` follow the same canonical serialization.
 
 ## Content and privacy
 
